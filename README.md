@@ -32,6 +32,7 @@ views. No server, no API, no dependencies beyond Python's stdlib.
 
 ```bash
 pip install --user .        # installs the `cpdb` CLI
+                            # (Arch/Debian: add --break-system-packages, or use pipx)
 cpdb build "/path/to/Cyberpunk 2077" cp2077.sqlite --lang en
 ```
 
