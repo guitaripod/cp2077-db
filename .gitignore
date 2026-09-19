@@ -1,0 +1,6 @@
+cp2077.sqlite
+*.sqlite
+__pycache__/
+*.egg-info/
+build/
+.venv/

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpdb"
+version = "1.0.0"
+description = "Extract every readable string from a Cyberpunk 2077 install into one queryable SQLite dataset"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Marcus" }]
+
+[project.scripts]
+cpdb = "cpdb.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["cpdb"]
+
+[tool.setuptools.package-data]
+cpdb = ["data/*", "lib/*"]
