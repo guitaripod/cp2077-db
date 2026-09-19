@@ -36,6 +36,9 @@ GAME_LANGS = ["ar", "cs", "de", "en", "es-es", "es-mx", "fr", "hu", "it", "ja",
 
 SOURCES = (("base", "content"), ("ep1", "ep1"))
 
+#: Bumped whenever the table/view layout changes in a way a consumer would see.
+SCHEMA_VERSION = 2
+
 
 class BuildError(RuntimeError):
     """Raised when the game install does not contain the required inputs."""
@@ -266,7 +269,8 @@ class DatasetBuilder:
         print(f"dataset built in {time.time()-t0:.1f}s -> {out}")
 
     def _build_meta(self, con: sqlite3.Connection) -> None:
-        for key, value in (("lang", self.lang),
+        for key, value in (("schema_version", str(SCHEMA_VERSION)),
+                           ("lang", self.lang),
                            ("input_fingerprint", self._fingerprint())):
             con.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?)", (key, value)
@@ -555,6 +559,7 @@ class DatasetBuilder:
 
     def _build_subtitles(self, con: sqlite3.Connection) -> None:
         pc = self.game_dir / "archive" / "pc"
+        rows: list[tuple] = []
         n = 0
         for prefix, folder in SOURCES:
             arch = pc / folder / f"lang_{self.lang}_text.archive"
@@ -574,12 +579,15 @@ class DatasetBuilder:
                         continue
                     body = (e.get("femaleVariant")
                             or e.get("maleVariant") or "").replace("\\n", "\n")
-                    con.execute(
-                        "INSERT INTO subtitles (source, file_path, string_id, line)"
-                        " VALUES (?, ?, ?, ?)",
-                        (prefix, path, str(e.get("stringId") or 0), body),
+                    rows.append(
+                        (prefix, path, str(e.get("stringId") or 0), body)
                     )
                     n += 1
+        con.executemany(
+            "INSERT INTO subtitles (source, file_path, string_id, line)"
+            " VALUES (?, ?, ?, ?)",
+            rows,
+        )
         print(f"subtitles: {n}")
 
     # ------------------------------------------------------------------- fts
@@ -651,6 +659,7 @@ CREATE TABLE tweak_queries (
 );
 
 CREATE TABLE journal (
+    id INTEGER PRIMARY KEY,
     source TEXT NOT NULL,
     kind TEXT NOT NULL,
     entry_id TEXT NOT NULL,
@@ -663,6 +672,7 @@ CREATE INDEX idx_journal_kind ON journal (kind);
 CREATE INDEX idx_journal_path ON journal (path);
 
 CREATE TABLE subtitles (
+    id INTEGER PRIMARY KEY,
     source TEXT NOT NULL,
     file_path TEXT NOT NULL,
     string_id TEXT NOT NULL,
@@ -687,12 +697,28 @@ SELECT
     j.source,
     j.path AS page_path,
     p.title AS page_title,
-    group_concat(j.title, '\\n') AS section_titles,
-    group_concat(NULLIF(j.body, ''), '\\n\\n') AS body
+    group_concat(j.title, char(10)) AS section_titles,
+    group_concat(NULLIF(j.body, ''), char(10) || char(10)) AS body
 FROM journal j
 JOIN journal p ON p.path = j.path AND p.kind = 'internet_page' AND p.source = j.source
 WHERE j.kind = 'shard_text'
 GROUP BY j.source, j.path;
+
+CREATE VIEW v_dialogue AS
+-- Spoken lines with the scene file they belong to (q101, sq027, ...).
+SELECT
+    s.id,
+    s.source,
+    replace(
+        replace(s.file_path,
+                rtrim(s.file_path, replace(s.file_path, char(92), '')), ''),
+        '.json', ''
+    ) AS scene,
+    s.string_id,
+    s.line,
+    s.file_path
+FROM subtitles s
+WHERE s.line <> '';
 
 CREATE VIEW v_shard_texts AS
 SELECT j.* FROM journal j WHERE kind = 'shard_text' AND body != '';
@@ -737,17 +763,20 @@ WHERE r.type IN ('Perk', 'NewPerk', 'BuildPerk', 'BuildNewPerk')
 FTS_SCHEMA = """
 CREATE VIRTUAL TABLE journal_fts USING fts5(
     title, body, path,
-    content='journal', content_rowid='rowid',
+    prefix = '2 3',
+    content='journal', content_rowid='id',
     tokenize = "unicode61 remove_diacritics 2"
 );
 CREATE VIRTUAL TABLE lockeys_fts USING fts5(
     secondary_key, female_variant, male_variant,
+    prefix = '2 3',
     content='lockeys', content_rowid='rowid',
     tokenize = "unicode61 remove_diacritics 2"
 );
 CREATE VIRTUAL TABLE subtitles_fts USING fts5(
     line,
-    content='subtitles', content_rowid='rowid',
+    prefix = '2 3',
+    content='subtitles', content_rowid='id',
     tokenize = "unicode61 remove_diacritics 2"
 );
 """

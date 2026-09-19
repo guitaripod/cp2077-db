@@ -10,7 +10,7 @@ from pathlib import Path
 
 VIEWS = (
     "v_shards", "v_shard_texts", "v_codex", "v_emails", "v_quests",
-    "v_tarots", "v_items", "v_vehicles", "v_perks",
+    "v_tarots", "v_dialogue", "v_items", "v_vehicles", "v_perks",
 )
 
 
@@ -35,6 +35,109 @@ def fmt_rows(rows: list[tuple], cols: list[str], wide: bool) -> str:
         for row in rows
     )
     return f"{head}\n{sep}\n{body}"
+
+
+#: Dataset layout this CLI speaks; kept in step with build.SCHEMA_VERSION.
+REQUIRED_SCHEMA_VERSION = 2
+
+SEARCH_SOURCES = ("journal", "lockey", "subtitle")
+
+SEARCH_SQL = {
+    "journal": (
+        "SELECT j.id AS id, j.kind AS kind, j.path AS ctx, j.title AS title, "
+        "snippet(journal_fts, -1, '[', ']', '…', 14) AS excerpt, "
+        "bm25(journal_fts) AS rank "
+        "FROM journal_fts JOIN journal j ON j.id = journal_fts.rowid "
+        "WHERE journal_fts MATCH ? ORDER BY rank LIMIT ?"
+    ),
+    "lockey": (
+        "SELECT l.rowid AS id, 'lockey' AS kind, l.loc_key AS ctx, "
+        "l.secondary_key AS title, "
+        "snippet(lockeys_fts, -1, '[', ']', '…', 14) AS excerpt, "
+        "bm25(lockeys_fts) AS rank "
+        "FROM lockeys_fts JOIN lockeys l ON l.rowid = lockeys_fts.rowid "
+        "WHERE lockeys_fts MATCH ? ORDER BY rank LIMIT ?"
+    ),
+    "subtitle": (
+        "SELECT s.id AS id, 'subtitle' AS kind, s.file_path AS ctx, "
+        "'' AS title, "
+        "snippet(subtitles_fts, -1, '[', ']', '…', 14) AS excerpt, "
+        "bm25(subtitles_fts) AS rank "
+        "FROM subtitles_fts JOIN subtitles s ON s.id = subtitles_fts.rowid "
+        "WHERE subtitles_fts MATCH ? ORDER BY rank LIMIT ?"
+    ),
+}
+
+SEARCH_COLUMNS = ["src", "id", "kind", "ctx", "title", "excerpt", "rank"]
+
+
+def ranked_search(con: sqlite3.Connection, query: str, sources: list[str],
+                  limit: int) -> list[tuple]:
+    """Best matches per index, interleaved so every source gets a fair share.
+
+    Each index is queried and bm25-ranked separately (lower is better). They are
+    then interleaved rather than merged by score: lockey entries are single short
+    strings and would otherwise take every top slot from shards and dialogue.
+    """
+    per_source = []
+    for src in sources:
+        rows = [(src, *tuple(row))
+                for row in con.execute(SEARCH_SQL[src], (query, limit))]
+        if rows:
+            per_source.append(rows)
+    merged: list[tuple] = []
+    while per_source and len(merged) < limit:
+        per_source.sort(key=lambda rows: rows[0][-1])
+        for rows in list(per_source):
+            merged.append(rows.pop(0))
+            if not rows:
+                per_source.remove(rows)
+            if len(merged) >= limit:
+                break
+    return merged
+
+
+def schema_version(con: sqlite3.Connection) -> int:
+    """The dataset's schema version; 1 for datasets built before it was stored."""
+    try:
+        row = con.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    try:
+        return int(row[0]) if row else 1
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_sources(value: str | None) -> list[str]:
+    if not value:
+        return list(SEARCH_SOURCES)
+    chosen = [s.strip() for s in value.split(",") if s.strip()]
+    unknown = [s for s in chosen if s not in SEARCH_SOURCES]
+    if unknown:
+        raise SystemExit(
+            f"error: unknown search source(s) {', '.join(unknown)}; "
+            f"choose from {', '.join(SEARCH_SOURCES)}"
+        )
+    return chosen
+
+
+def path_children(con: sqlite3.Connection, prefix: str) -> list[tuple]:
+    """Direct children of a journal path with their entry counts, sorted."""
+    like = f"{prefix}/%" if prefix else "%"
+    depth = len(prefix.split("/")) if prefix else 0
+    counts: dict[str, int] = {}
+    for (path,) in con.execute(
+        "SELECT path FROM journal WHERE path <> '' AND path LIKE ?", (like,)
+    ):
+        parts = path.split("/")
+        if len(parts) <= depth:
+            continue
+        child = "/".join(parts[: depth + 1])
+        counts[child] = counts.get(child, 0) + 1
+    return sorted(counts.items())
 
 
 def build_command(argv: list[str]) -> int:
@@ -83,8 +186,19 @@ def main(argv: list[str] | None = None) -> int:
     p_search = sub.add_parser("search", help="full-text search across all content")
     p_search.add_argument("query", help="FTS5 MATCH expression, e.g. 'militech' or '\"Arasaka tower\"'")
     p_search.add_argument("--limit", type=int, default=20)
+    p_search.add_argument("--source", default=None,
+                          help=f"comma-separated subset of: {', '.join(SEARCH_SOURCES)}")
     p_search.add_argument("--json", action="store_true")
     p_search.add_argument("--wide", action="store_true")
+
+    p_page = sub.add_parser("page", help="print one shard/internet page in full")
+    p_page.add_argument("path", help="page path or a fragment of it")
+    p_page.add_argument("--json", action="store_true")
+
+    p_tree = sub.add_parser("tree", help="journal categories under a path, with counts")
+    p_tree.add_argument("path", nargs="?", default="",
+                        help="path prefix, e.g. codex/characters (default: the roots)")
+    p_tree.add_argument("--json", action="store_true")
 
     p_table = sub.add_parser("table", help="list rows of a curated view or table")
     p_table.add_argument("name", help=f"one of: {', '.join(VIEWS)} or any table")
@@ -105,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     p_item.add_argument("--json", action="store_true")
 
     p_stats = sub.add_parser("stats", help="row counts per table/view")
+    p_stats.add_argument("--json", action="store_true")
 
     args = ap.parse_args(argv)
 
@@ -120,27 +235,55 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     con.row_factory = sqlite3.Row
 
+    found = schema_version(con)
+    if found != REQUIRED_SCHEMA_VERSION:
+        con.close()
+        print(f"error: {db} has dataset schema version {found}, this cpdb needs "
+              f"{REQUIRED_SCHEMA_VERSION} — rebuild it with: cpdb build <game dir> {db}",
+              file=sys.stderr)
+        return 2
+
     try:
         if args.cmd == "search":
-            union = (
-                "SELECT 'journal' AS src, j.rowid, jf.title, jf.body, jf.path AS ctx "
-                "FROM journal_fts jf JOIN journal j ON j.rowid = jf.rowid "
-                "WHERE journal_fts MATCH ? "
-                "UNION ALL "
-                "SELECT 'lockey' AS src, l.rowid, l.secondary_key, l.female_variant, '' "
-                "FROM lockeys_fts lf JOIN lockeys l ON l.rowid = lf.rowid "
-                "WHERE lockeys_fts MATCH ? "
-                "UNION ALL "
-                "SELECT 'subtitle' AS src, s.rowid, '', sf.line, s.file_path "
-                "FROM subtitles_fts sf JOIN subtitles s ON s.rowid = sf.rowid "
-                "WHERE subtitles_fts MATCH ? "
-                "LIMIT ?"
-            )
-            rows = con.execute(union, (args.query, args.query, args.query, args.limit)).fetchall()
-            cols = ["src", "rowid", "title", "body", "ctx"]
-            print(json.dumps([dict(zip(cols, tuple(r))) for r in rows], indent=1)
-                  if args.json
-                  else fmt_rows([tuple(r) for r in rows], cols, True))
+            rows = ranked_search(con, args.query, parse_sources(args.source),
+                                 args.limit)
+            if args.json:
+                print(json.dumps([dict(zip(SEARCH_COLUMNS, r)) for r in rows],
+                                 indent=1))
+            else:
+                print(fmt_rows(rows, SEARCH_COLUMNS, True))
+
+        elif args.cmd == "page":
+            rows = con.execute(
+                "SELECT source, page_path, page_title, body FROM v_shards "
+                "WHERE page_path = ? OR page_path LIKE ? ORDER BY page_path",
+                (args.path, f"%{args.path}%"),
+            ).fetchall()
+            if not rows:
+                print(f"no page matching {args.path!r}", file=sys.stderr)
+                return 1
+            if args.json:
+                print(json.dumps([dict(r) for r in rows], indent=1))
+            else:
+                for row in rows:
+                    print(f"=== {row['page_path']}  ({row['source']})")
+                    if row["page_title"]:
+                        print(row["page_title"])
+                    print()
+                    print(row["body"] or "(no text)")
+                    print()
+
+        elif args.cmd == "tree":
+            children = path_children(con, args.path.strip("/"))
+            if not children:
+                print(f"no journal paths under {args.path!r}", file=sys.stderr)
+                return 1
+            if args.json:
+                print(json.dumps([{"path": p, "entries": n}
+                                  for p, n in children], indent=1))
+            else:
+                print(fmt_rows([(p, n) for p, n in children],
+                               ["path", "entries"], False))
 
         elif args.cmd == "table":
             if not args.columns:
@@ -202,14 +345,23 @@ def main(argv: list[str] | None = None) -> int:
 
         elif args.cmd == "stats":
             names = [r[0] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%' ORDER BY name")]
-            for n in names:
-                cnt = con.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0]
-                print(f"{n:20s} {cnt:>10d}")
-            print()
-            for v in VIEWS:
-                cnt = con.execute(f'SELECT COUNT(*) FROM "{v}"').fetchone()[0]
-                print(f"{v:20s} {cnt:>10d}")
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%' "
+                "ORDER BY name")]
+            tables = [(n, con.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0])
+                      for n in names]
+            views = [(v, con.execute(f'SELECT COUNT(*) FROM "{v}"').fetchone()[0])
+                     for v in VIEWS]
+            if args.json:
+                print(json.dumps({"tables": dict(tables), "views": dict(views)},
+                                 indent=1))
+            else:
+                for name, cnt in tables:
+                    print(f"{name:20s} {cnt:>10d}")
+                print()
+                for name, cnt in views:
+                    print(f"{name:20s} {cnt:>10d}")
+
     except sqlite3.Error as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

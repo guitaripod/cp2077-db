@@ -17,12 +17,17 @@ views. No server, no API, no dependencies beyond Python's stdlib.
 | `tweak_flats` | All TweakDB flat values with their red types (6.19M) |
 | `tweak_flat_texts` | LocKey-carrying flats resolved to text (126,927) |
 | `tweak_queries` | TweakDB queries (record group definitions) |
-| `journal_fts`, `lockeys_fts`, `subtitles_fts` | FTS5 indexes over all of the above |
+| `journal_fts`, `lockeys_fts`, `subtitles_fts` | FTS5 indexes (bm25-ranked, 2- and 3-character prefix indexes for autocomplete) |
 | `v_shards` | Internet pages (shards) with concatenated readable text, one row per page |
 | `v_shard_texts` | Individual text widgets of shard pages |
 | `v_codex`, `v_emails`, `v_quests`, `v_tarots` | Codex, emails, quests, tarot cards |
+| `v_dialogue` | Spoken lines with the scene they belong to (`q101`, `sq027`, …) |
 | `v_items` | Items with display name + description resolved |
 | `v_vehicles`, `v_perks` | Vehicles and perks with resolved text |
+
+`journal.id` and `subtitles.id` are stable integer keys within a build (the build is
+deterministic, so they are stable across rebuilds of the same game version) — use them as
+foreign keys from your own tables. `meta.schema_version` tells you which layout a file has.
 
 `journal.path` mirrors the game's internal category tree
 (`codex/characters/quests/johnny_silverhand`, `onscreens/emails/quests/...`,
@@ -60,14 +65,19 @@ CPDB_SLOW=1 TMPDIR=/some/disk python -m unittest tests.test_build   # + determin
 vectors, VLQ decoding, the one-based `raRef` import index, skip-by-declared-size
 for unknown red types, and every malformed-archive path (junk, truncated header,
 bad version, out-of-range index or segment range, duplicate name hashes).
-`tests/test_build.py` builds from a real install and checks row counts, view
-content, FTS hits, the timestamp-free `meta` table, and — with `CPDB_SLOW=1` —
-that two independent builds are byte-identical.
+`tests/test_query.py` builds a miniature dataset from the real schema and covers the
+query layer: ranked search, excerpts, source filters, `page`, `tree`, the schema-version
+guard and the curated views. `tests/test_build.py` builds from a real install and checks
+row counts, view content, FTS hits, the timestamp-free `meta` table, and — with
+`CPDB_SLOW=1` — that two independent builds are byte-identical.
 
 ## Query
 
 ```bash
-cpdb cp2077.sqlite search '"Arasaka tower"'
+cpdb cp2077.sqlite search '"Arasaka tower"'              # bm25-ranked, with excerpts
+cpdb cp2077.sqlite search 'neurotox*' --source subtitle  # one index only
+cpdb cp2077.sqlite tree codex/characters                 # categories + entry counts
+cpdb cp2077.sqlite page n54/tower                        # one shard page in full
 cpdb cp2077.sqlite table v_shards --where "page_path LIKE '%n54%'" --limit 5
 cpdb cp2077.sqlite table v_items --where "display_name LIKE '%Yukimura%'"
 cpdb cp2077.sqlite item Items.Preset_Yukimura_Default

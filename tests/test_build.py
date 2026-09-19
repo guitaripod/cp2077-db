@@ -80,14 +80,15 @@ class BuildTests(unittest.TestCase):
     def test_views_resolve_text(self):
         for view, minimum in (("v_shards", 600), ("v_codex", 500),
                               ("v_emails", 500), ("v_quests", 500),
-                              ("v_tarots", 20), ("v_items", 10_000),
+                              ("v_tarots", 20), ("v_dialogue", 100_000), ("v_items", 10_000),
                               ("v_vehicles", 100), ("v_perks", 100)):
             with self.subTest(view=view):
                 self.assertGreaterEqual(self.count(view), minimum)
 
     def test_meta_has_no_wall_clock_fields(self):
         meta = dict(self.con.execute("SELECT key, value FROM meta"))
-        self.assertEqual(set(meta), {"lang", "input_fingerprint"})
+        self.assertEqual(set(meta),
+                         {"schema_version", "lang", "input_fingerprint"})
         self.assertEqual(meta["lang"], "en")
         self.assertEqual(len(meta["input_fingerprint"]), 64)
 
@@ -99,6 +100,21 @@ class BuildTests(unittest.TestCase):
                     (match,),
                 ).fetchone()[0]
                 self.assertGreater(hits, 0)
+
+    def test_dialogue_scenes_are_file_names_not_paths(self):
+        scenes = [r[0] for r in self.con.execute(
+            "SELECT DISTINCT scene FROM v_dialogue LIMIT 50")]
+        self.assertTrue(scenes)
+        for scene in scenes:
+            self.assertNotIn("\\", scene)
+            self.assertFalse(scene.endswith(".json"))
+
+    def test_shard_bodies_use_real_newlines(self):
+        body = self.con.execute(
+            "SELECT body FROM v_shards WHERE length(body) > 200 LIMIT 1"
+        ).fetchone()[0]
+        self.assertIn("\n", body)
+        self.assertNotIn("\\n", body)
 
     def test_journal_paths_are_hierarchical(self):
         roots = {

@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from cpdb import cr2w  # noqa: E402
+from cpdb import cli, cr2w  # noqa: E402
 from cpdb.build import (  # noqa: E402
     GAME_LANGS,
     BuildError,
@@ -332,6 +332,9 @@ class CliTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         self.db = self.dir / "tiny.sqlite"
         con = sqlite3.connect(self.db)
+        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("INSERT INTO meta VALUES ('schema_version', ?)",
+                    (str(cli.REQUIRED_SCHEMA_VERSION),))
         con.execute("CREATE TABLE journal (title TEXT)")
         con.execute("INSERT INTO journal VALUES ('Arasaka tower')")
         con.commit()
