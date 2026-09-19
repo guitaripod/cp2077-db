@@ -6,6 +6,8 @@ covered separately by `test_build.py`, which skips unless a game is present.
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import sqlite3
 import struct
 import sys
@@ -31,6 +33,7 @@ from cpdb.engine import (  # noqa: E402
     fnv1a64,
     kark_decompress,
 )
+from cpdb.textures import dds_wrap, image_key, tarot_part  # noqa: E402
 from cpdb.tweakdb import TweakDBError, murmur3, parse as parse_tweakdb, tweakdbid_hash  # noqa: E402
 
 
@@ -109,6 +112,29 @@ class ResourceRefTests(unittest.TestCase):
 
 def _variable(name_idx: int, type_idx: int, payload: bytes) -> bytes:
     return struct.pack("<HHI", name_idx, type_idx, len(payload) + 4) + payload
+
+
+class StaticArrayAndBufferTests(unittest.TestCase):
+    """`[n]T` static arrays and DataBuffer references, as atlases and
+    textures use them: a u32 count then n elements; a u16 buffer index."""
+
+    def setUp(self):
+        self.f = _cr2w_file(["None", "Uint32", "Left", "Float", "RectF"], [])
+
+    def read(self, raw: bytes, red_type: str):
+        return cr2w._read_value(cr2w._Reader(raw), self.f, red_type, len(raw))
+
+    def test_static_array_reads_declared_count(self):
+        raw = struct.pack("<IIII", 3, 7, 8, 9)
+        self.assertEqual(self.read(raw, "[3]Uint32"), [7, 8, 9])
+
+    def test_data_buffer_is_a_one_based_index(self):
+        self.assertEqual(self.read(struct.pack("<H", 1), "DataBuffer"), {"$buffer": 1})
+        self.assertEqual(self.read(struct.pack("<H", 0), "serializationDeferredDataBuffer"), {"$buffer": 0})
+
+    def test_uppercase_struct_is_read_as_nested_class(self):
+        body = b"\x00" + _variable(2, 3, struct.pack("<f", 0.25)) + struct.pack("<H", 0)
+        self.assertEqual(self.read(body, "RectF"), {"$type": "RectF", "Left": 0.25})
 
 
 class UnknownTypeTests(unittest.TestCase):
@@ -246,6 +272,87 @@ class ArchiveTests(unittest.TestCase):
 
     def test_kark_passthrough_without_magic(self):
         self.assertEqual(kark_decompress(b"plain bytes"), b"plain bytes")
+
+    def test_multi_segment_entry_returns_buffers_and_verifies_sha1(self):
+        main, buffer = b"main-cr2w-bytes", b"texture-payload"
+        entry_size = 56
+        index = _index(num_files=1, num_segments=2, tail=b"")
+        data_start = 40 + len(index) + entry_size + 2 * 16
+        segments = (struct.pack("<QII", data_start, len(main), len(main))
+                    + struct.pack("<QII", data_start + len(main), len(buffer), len(buffer)))
+        sha1 = hashlib.sha1(main + buffer).digest()
+        entry = struct.pack("<QQIIIII", 5, 0, 1, 0, 2, 0, 0) + sha1
+        data = _rdar(index + entry + segments) + main + buffer
+        with Archive(self.write(data)) as ar:
+            self.assertEqual(ar.read_entry_with_buffers(5), (main, [buffer]))
+            self.assertEqual(ar.read_entry(5), main)
+
+    def test_multi_segment_sha1_mismatch_is_reported(self):
+        main, buffer = b"main", b"buf"
+        index = _index(num_files=1, num_segments=2)
+        data_start = 40 + len(index) + 56 + 2 * 16
+        segments = (struct.pack("<QII", data_start, 4, 4)
+                    + struct.pack("<QII", data_start + 4, 3, 3))
+        entry = struct.pack("<QQIIIII", 5, 0, 1, 0, 2, 0, 0) + b"\x00" * 20
+        data = _rdar(index + entry + segments) + main + buffer
+        with Archive(self.write(data)) as ar:
+            with self.assertRaises(ArchiveError) as cm:
+                ar.read_entry_with_buffers(5)
+            self.assertIn("SHA1", str(cm.exception))
+
+
+class TextureTests(unittest.TestCase):
+    def test_dds_header_is_128_bytes_for_dxt(self):
+        wrapped = dds_wrap("TCM_DXTAlpha", 8, 4, b"\x00" * 32)
+        self.assertEqual(wrapped[:4], b"DDS ")
+        self.assertEqual(len(wrapped), 128 + 32)
+        self.assertEqual(struct.unpack_from("<II", wrapped, 12), (4, 8))
+        self.assertEqual(wrapped[84:88], b"DXT5")
+
+    def test_bc7_gets_a_dx10_extension(self):
+        wrapped = dds_wrap("TCM_QualityColor", 4, 4, b"\x00" * 16)
+        self.assertEqual(len(wrapped), 148 + 16)
+        self.assertEqual(wrapped[84:88], b"DX10")
+        self.assertEqual(struct.unpack_from("<I", wrapped, 128)[0], 99)
+
+    def test_unknown_compression_is_rejected(self):
+        from cpdb.textures import TextureError
+        with self.assertRaises(TextureError):
+            dds_wrap("TCM_Whatever", 4, 4, b"")
+
+    def test_image_key_joins_atlas_and_part(self):
+        self.assertEqual(image_key("base\\a.inkatlas", "p"), "base\\a.inkatlas#p")
+
+    def test_tarot_names_map_onto_big_atlas_parts(self):
+        parts = {"tarot_deathBIG", "tarot_highpriestessBIG", "tarot_judgementBIG",
+                 "tarot_wheeloffortuneBIG", "tarot_king_of_cupsBIG",
+                 "tarot_fool01BIG", "tarot_fool02BIG", "tarot_fool03BIG"}
+        cases = {
+            ("TarotCard_Death", "mq033_death"): "tarot_deathBIG",
+            ("TarotCard_HighPristess", "mq033_the_high_priestess"): "tarot_highpriestessBIG",
+            ("TarotCard_Judgment", "mq033_judgement"): "tarot_judgementBIG",
+            ("TarotCard_WheelOfForutune", "mq033_the_wheel_of_fortune"): "tarot_wheeloffortuneBIG",
+            ("TarotCard_KingOfCups", "mq033_ep1_king_of_the_cups"): "tarot_king_of_cupsBIG",
+            ("TarotCard_Fool", "mq033_the_fool"): "tarot_fool01BIG",
+            ("TarotCard_Fool", "mq033_the_fool1"): "tarot_fool02BIG",
+            ("TarotCard_Fool", "mq033_the_fool2"): "tarot_fool03BIG",
+            ("TarotCard_Nope", "x"): None,
+        }
+        for (part, entry), expected in cases.items():
+            self.assertEqual(tarot_part(part, entry, parts), expected, part)
+
+    def test_encode_drops_unused_alpha(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        from cpdb.textures import encode
+        opaque, w, h = encode(Image.new("RGBA", (16, 8), (200, 30, 30, 255)))
+        self.assertEqual((w, h), (16, 8))
+        self.assertEqual(opaque[8:12], b"WEBP")
+        self.assertEqual(Image.open(io.BytesIO(opaque)).mode, "RGB")
+        translucent, _, _ = encode(Image.new("RGBA", (16, 8), (200, 30, 30, 90)))
+        self.assertEqual(Image.open(io.BytesIO(translucent)).mode, "RGBA")
 
 
 def _open_handles(path: Path) -> int:

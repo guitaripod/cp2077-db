@@ -185,41 +185,58 @@ class Archive:
             self.dependencies.append(dep)
 
     def read_entry(self, name_hash64: int) -> bytes:
-        """Extract one entry, verifying its SHA1 against the index."""
+        """Extract one entry's main file, verifying its SHA1 against the index."""
+        return self.read_entry_with_buffers(name_hash64)[0]
+
+    def read_entry_with_buffers(self, name_hash64: int) -> tuple[bytes, list[bytes]]:
+        """Extract the main file plus its trailing buffer segments, decompressed.
+
+        The index SHA1 covers the decompressed first segment followed by the
+        buffer segments as stored on disk, which is how textures are laid out.
+        """
         try:
             entry = self.files[name_hash64]
         except KeyError:
             raise ArchiveError(
                 f"{self.path.name}: no entry with hash {name_hash64:#x}"
             ) from None
-        if not (0 <= entry.segments_start <= entry.segments_end
+        if not (0 <= entry.segments_start < entry.segments_end
                 <= len(self.segments)):
             raise ArchiveError(
                 f"{self.path.name}: entry {name_hash64:#x} has out-of-range "
                 f"segment range [{entry.segments_start}, {entry.segments_end})"
             )
-        parts = []
-        for i in range(entry.segments_start, entry.segments_end):
-            s_off, s_zsize, s_size = self.segments[i]
-            self._f.seek(s_off)
-            raw = self._f.read(s_zsize)
-            if len(raw) != s_zsize:
-                raise ArchiveError(
-                    f"{self.path.name}: truncated segment {i} "
-                    f"(wanted {s_zsize}, got {len(raw)})"
-                )
-            if s_zsize == s_size:
-                parts.append(raw)
-            elif raw[:4] == KARK_MAGIC:
-                parts.append(kark_decompress(raw))
-            else:
-                parts.append(kraken_decompress(raw, s_size))
-        data = b"".join(parts)
-        if hashlib.sha1(data).digest() != entry.sha1:
+        raws = [self._read_raw_segment(i)
+                for i in range(entry.segments_start, entry.segments_end)]
+        main = self._decompress(raws[0], self.segments[entry.segments_start][2])
+        digest = hashlib.sha1(main + b"".join(raws[1:])).digest()
+        if digest != entry.sha1:
             raise ArchiveError(
                 f"{self.path.name}: entry {name_hash64:#x} failed SHA1 check"
             )
-        return data
+        buffers = [self._decompress(raw, self.segments[i][2])
+                   for i, raw in zip(range(entry.segments_start + 1,
+                                           entry.segments_end), raws[1:])]
+        return main, buffers
+
+    def _read_raw_segment(self, i: int) -> bytes:
+        s_off, s_zsize, _ = self.segments[i]
+        self._f.seek(s_off)
+        raw = self._f.read(s_zsize)
+        if len(raw) != s_zsize:
+            raise ArchiveError(
+                f"{self.path.name}: truncated segment {i} "
+                f"(wanted {s_zsize}, got {len(raw)})"
+            )
+        return raw
+
+    @staticmethod
+    def _decompress(raw: bytes, size: int) -> bytes:
+        if len(raw) == size:
+            return raw
+        if raw[:4] == KARK_MAGIC:
+            return kark_decompress(raw)
+        return kraken_decompress(raw, size)
 
 
 def extract(path: Path, name_hash64: int) -> bytes:

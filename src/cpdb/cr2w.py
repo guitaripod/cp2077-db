@@ -22,7 +22,7 @@ FNV_PRIME = 0x100000001B3
 CR2W_MIN_VERSION = 163
 CR2W_MAX_VERSION = 195
 
-CLASS_RE = re.compile(r"^[a-z][A-Za-z0-9_]*$")
+CLASS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
 class CR2WError(ValueError):
@@ -80,6 +80,7 @@ class CR2WFile:
     def __init__(self) -> None:
         self.version: int = 0
         self.strings: dict[int, str] = {}      # offset -> string
+        self.buffers: list[dict] = []          # offset, disk_size, mem_size
         self.names: list[str] = []            # index -> name
         self.imports: list[str] = []
         self.exports: list[dict] = []          # className, dataSize, dataOffset
@@ -138,6 +139,12 @@ def read_cr2w(data: bytes) -> CR2WFile:
     for _ in range(count):
         so, cn, _fl = struct.unpack("<IHH", r.read(8))
         f.imports.append(f.strings[so])
+
+    off, count = tables[5]
+    r.seek(off)
+    for _ in range(count):
+        _flags, _index, boff, dsize, msize, _crc = struct.unpack("<IIIIII", r.read(24))
+        f.buffers.append({"offset": boff, "disk_size": dsize, "mem_size": msize})
 
     # table 3: properties (unused in these files) — skip struct size 24
     # table 4: exports (24 bytes each)
@@ -276,6 +283,13 @@ def _read_value(r: _Reader, f: CR2WFile, red_type: str, size: int):
         if count > 1_000_000:
             raise ValueError(f"implausible array count {count}")
         return [_read_value(r, f, inner, 0) for _ in range(count)]
+    if red_type.startswith("[") and "]" in red_type:
+        n_str, inner = red_type[1:].split("]", 1)
+        r.u32()
+        return [_read_value(r, f, inner, 0) for _ in range(int(n_str))]
+    if red_type in ("DataBuffer", "serializationDeferredDataBuffer",
+                    "SharedDataBuffer"):
+        return {"$buffer": r.u16()}
     if red_type.startswith("static:"):
         # static array: static:[n; inner]
         rest = red_type[len("static:"):]

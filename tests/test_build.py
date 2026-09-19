@@ -92,7 +92,7 @@ class BuildTests(unittest.TestCase):
     def test_meta_has_no_wall_clock_fields(self):
         meta = dict(self.con.execute("SELECT key, value FROM meta"))
         self.assertEqual(set(meta),
-                         {"schema_version", "lang", "input_fingerprint"})
+                         {"schema_version", "lang", "images", "input_fingerprint"})
         self.assertEqual(meta["lang"], "en")
         self.assertEqual(len(meta["input_fingerprint"]), 64)
 
@@ -129,6 +129,21 @@ class BuildTests(unittest.TestCase):
         }
         self.assertTrue({"codex", "onscreens", "internet_sites"} <= roots, roots)
 
+    def test_journal_entries_reference_pictures_even_without_images(self):
+        keyed = self.con.execute(
+            "SELECT COUNT(*) FROM journal WHERE kind = 'codex_entry' "
+            "AND json_extract(extra, '$.image') LIKE '%.inkatlas#%'").fetchone()[0]
+        self.assertGreater(keyed, 400)
+        tarots = self.con.execute(
+            "SELECT COUNT(*) FROM v_tarots WHERE image LIKE '%BIG'").fetchone()[0]
+        self.assertEqual(tarots, 28)
+        avatars = self.con.execute(
+            "SELECT COUNT(*) FROM v_contacts WHERE avatar IS NOT NULL").fetchone()[0]
+        self.assertGreater(avatars, 100)
+        self.assertEqual(self.count("images"), 0)
+        self.assertEqual(self.con.execute(
+            "SELECT value FROM meta WHERE key = 'images'").fetchone()[0], "0")
+
     def test_every_codex_row_carries_readable_text(self):
         """Description entries have no title of their own, but always a body."""
         blank = self.con.execute(
@@ -136,6 +151,62 @@ class BuildTests(unittest.TestCase):
             "WHERE COALESCE(title, '') = '' AND COALESCE(body, '') = ''"
         ).fetchone()[0]
         self.assertLessEqual(blank, 1)
+
+
+def have_pillow() -> bool:
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(HAVE_GAME, "no Cyberpunk 2077 install found")
+@unittest.skipUnless(os.environ.get("CPDB_SLOW") == "1", "slow: set CPDB_SLOW=1")
+@unittest.skipUnless(have_pillow(), "Pillow not installed")
+class ImageBuildTests(unittest.TestCase):
+    """One build with images, then the picture table checked against it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db_path = Path(cls.tmp.name) / "cp2077.sqlite"
+        DatasetBuilder(GAME, cls.db_path, "en", images=True).build()
+        cls.con = sqlite3.connect(f"file:{cls.db_path}?mode=ro", uri=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.con.close()
+        cls.tmp.cleanup()
+
+    def test_every_referenced_key_has_a_picture(self):
+        for field in ("image", "thumb", "avatar"):
+            missing = self.con.execute(
+                f"SELECT COUNT(*) FROM journal j WHERE json_extract(j.extra, '$.{field}')"
+                f" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM images i"
+                f" WHERE i.key = json_extract(j.extra, '$.{field}'))").fetchone()[0]
+            self.assertLessEqual(missing, 2, field)
+
+    def test_pictures_are_webp_at_native_size(self):
+        rows = self.con.execute(
+            "SELECT i.width, i.height, i.format, substr(i.data, 1, 4), substr(i.data, 9, 4)"
+            " FROM images i JOIN v_codex c ON c.image = i.key").fetchall()
+        self.assertGreater(len(rows), 400)
+        for width, height, fmt, riff, webp in rows:
+            self.assertEqual((fmt, riff, webp), ("webp", b"RIFF", b"WEBP"))
+            self.assertGreaterEqual(width, 640)
+            self.assertGreaterEqual(height, 360)
+
+    def test_tarot_cards_are_portrait(self):
+        rows = self.con.execute(
+            "SELECT i.width, i.height FROM images i JOIN v_tarots t ON t.image = i.key").fetchall()
+        self.assertEqual(len(rows), 28)
+        for width, height in rows:
+            self.assertGreater(height, width * 1.8)
+
+    def test_meta_records_images(self):
+        self.assertEqual(self.con.execute(
+            "SELECT value FROM meta WHERE key = 'images'").fetchone()[0], "1")
 
 
 @unittest.skipUnless(HAVE_GAME, "no Cyberpunk 2077 install found")

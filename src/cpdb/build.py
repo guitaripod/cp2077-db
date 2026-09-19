@@ -8,6 +8,8 @@ Inputs (all read directly from the game install):
     + ep1\\journal\\cooked_journal.journal (shards, codex, emails, ...)
   * WolvenKit hash tables (usedhashes.kark, tweakdbstr.kark) vendored under
     data/ for path and TweakDBID resolution
+  * with `images=True`: the .inkatlas/.xbm UI textures the journal points at
+    (codex art, avatars, tarot cards, net-page pictures), needing Pillow
 
 Output: one SQLite file with typed tables, curated views, and FTS5 full-text
 search over all readable text. The output is deterministic: identical inputs
@@ -26,6 +28,10 @@ from pathlib import Path
 
 from .cr2w import read_cr2w
 from .engine import Archive, ArchiveError, fnv1a64, kark_decompress
+from .textures import (
+    IMAGE_FORMAT, TextureError, TextureStore, encode as encode_image,
+    image_key, require_pillow, tarot_part,
+)
 from .tweakdb import parse as parse_tweakdb, tweakdbid_hash, murmur3
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -37,7 +43,10 @@ GAME_LANGS = ["ar", "cs", "de", "en", "es-es", "es-mx", "fr", "hu", "it", "ja",
 SOURCES = (("base", "content"), ("ep1", "ep1"))
 
 #: Bumped whenever the table/view layout changes in a way a consumer would see.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+#: Where the tarot card art lives; the journal names cards, not atlases.
+TAROT_ATLAS_DIR = "gameplay\\gui\\fullscreen\\tarot\\"
 
 
 class BuildError(RuntimeError):
@@ -189,7 +198,8 @@ def file_identity(path: Path) -> bytes:
 
 
 class DatasetBuilder:
-    def __init__(self, game_dir: Path, db_path: Path, lang: str = "en"):
+    def __init__(self, game_dir: Path, db_path: Path, lang: str = "en",
+                 images: bool = False):
         self.game_dir = Path(game_dir)
         self.db_path = Path(db_path)
         if lang not in GAME_LANGS:
@@ -197,7 +207,13 @@ class DatasetBuilder:
                 f"unknown language {lang!r}; one of: {' '.join(GAME_LANGS)}"
             )
         self.lang = lang
+        self.images = images
+        if images:
+            require_pillow()
         self._require_inputs()
+        self.textures = TextureStore(self.game_dir)
+        self.icons: dict[int, tuple[str, str]] = {}
+        self.image_keys: set[str] = set()
         self.used_hashes = load_used_hashes()
         self.tweak_names = load_tweak_names()
         self.record_types = load_record_types()
@@ -230,10 +246,15 @@ class DatasetBuilder:
             )
 
     def _fingerprint(self) -> str:
-        """SHA-256 over the content identity of every input file."""
+        """SHA-256 over the content identity of every input file.
+
+        Computed after the build so the archives the textures came from are
+        part of it; a build without images fingerprints fewer files.
+        """
         h = hashlib.sha256()
-        h.update(f"cpdb-1\nlang={self.lang}\n".encode())
-        for p in self.input_files():
+        h.update(f"cpdb-1\nlang={self.lang}\nimages={int(self.images)}\n".encode())
+        extra = sorted(self.textures.archives_used)
+        for p in self.input_files() + extra:
             h.update(f"{p.name}:{p.stat().st_size}:".encode())
             h.update(file_identity(p))
             h.update(b"\n")
@@ -251,12 +272,13 @@ class DatasetBuilder:
             # table is created), no run-dependent state.
             con.execute("PRAGMA page_size = 4096")
             con.executescript(SCHEMA)
-            self._build_meta(con)
             self._build_strings(con)
             self._build_tweakdb(con)
             self._build_journal(con)
             self._build_subtitles(con)
             self._build_fts(con)
+            self._build_images(con)
+            self._build_meta(con)
             con.commit()
             con.execute("VACUUM")
             con.close()
@@ -266,11 +288,14 @@ class DatasetBuilder:
             if tmp.exists():
                 tmp.unlink()
             raise
+        finally:
+            self.textures.close()
         print(f"dataset built in {time.time()-t0:.1f}s -> {out}")
 
     def _build_meta(self, con: sqlite3.Connection) -> None:
         for key, value in (("schema_version", str(SCHEMA_VERSION)),
                            ("lang", self.lang),
+                           ("images", str(int(self.images))),
                            ("input_fingerprint", self._fingerprint())):
             con.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?)", (key, value)
@@ -310,6 +335,7 @@ class DatasetBuilder:
             db = parse_tweakdb(path.read_bytes())
             flats = []
             flat_texts = []
+            icon_fields: dict[str, dict[str, object]] = {}
             for fid in sorted(db.flats):
                 val = db.flats[fid]
                 name = self.tweak_names.get(fid)
@@ -317,6 +343,9 @@ class DatasetBuilder:
                     continue
                 red_type = db.flat_type_by_id.get(fid, "")
                 flats.append((source, fid, name, red_type, flat_value_json(val)))
+                record, _, field = name.rpartition(".")
+                if field in ("atlasResourcePath", "atlasPartName"):
+                    icon_fields.setdefault(record, {})[field] = val
                 if red_type == "gamedataLocKeyWrapper" and isinstance(val, int):
                     flat_texts.append((source, fid, name, str(val),
                                        self.loc.text(val)))
@@ -337,6 +366,7 @@ class DatasetBuilder:
                 if name is None:
                     continue
                 records.append((source, rid, name, tname))
+            self._collect_icons(icon_fields)
             queries = []
             for qid in sorted(db.queries):
                 ents = db.queries[qid]
@@ -368,6 +398,76 @@ class DatasetBuilder:
                 f"{source}: {len(flats)} flats ({len(flat_texts)} localized),"
                 f" {len(records)} records, {len(queries)} queries"
             )
+
+    def _collect_icons(self, icon_fields: dict[str, dict[str, object]]) -> None:
+        """Record id -> (atlas path, part) for every UIIcon-shaped record."""
+        for record, fields in icon_fields.items():
+            atlas_hash = fields.get("atlasResourcePath")
+            part = fields.get("atlasPartName")
+            if not isinstance(atlas_hash, int) or not isinstance(part, str):
+                continue
+            atlas = self.used_hashes.get(atlas_hash)
+            if atlas and part:
+                self.icons[tweakdbid_hash(record)] = (atlas, part)
+
+    def _icon_key(self, value: object) -> str | None:
+        """The `images.key` an icon TweakDBID resolves to, if any."""
+        if isinstance(value, bool) or not isinstance(value, int) or not value:
+            return None
+        ref = self.icons.get(value)
+        if ref is None:
+            return None
+        key = image_key(*ref)
+        self.image_keys.add(key)
+        return key
+
+    def _atlas_key(self, atlas: object, part: object) -> str | None:
+        if not isinstance(atlas, str) or not isinstance(part, str):
+            return None
+        if not atlas or not part:
+            return None
+        key = image_key(atlas, part)
+        self.image_keys.add(key)
+        return key
+
+    @staticmethod
+    def _page_children(node: dict) -> list[dict]:
+        """A net page's texts and pictures, which hang off their own arrays
+        rather than `entries`."""
+        children = []
+        for field in ("texts", "images"):
+            for child in node.get(field) or []:
+                if isinstance(child, dict):
+                    children.append(child)
+        return children
+
+    def _with_image(self, extra: dict, icon_id: object) -> dict | None:
+        """`extra` plus an `image` key when the icon resolves; None if empty."""
+        key = self._icon_key(icon_id)
+        if key:
+            extra["image"] = key
+        return extra or None
+
+    def _tarot_key(self, image_part: object, entry_id: str) -> str | None:
+        """The big tarot card art for a journal tarot entry."""
+        if not isinstance(image_part, str) or not image_part:
+            return None
+        for atlas in self._tarot_atlases():
+            try:
+                parts = set(self.textures.slots(atlas)[0])
+            except (TextureError, ArchiveError, IndexError):
+                continue
+            name = tarot_part(image_part, entry_id, parts)
+            if name:
+                return self._atlas_key(atlas, name)
+        return None
+
+    def _tarot_atlases(self) -> list[str]:
+        return sorted(
+            p for p in self.used_hashes.values()
+            if TAROT_ATLAS_DIR in p and p.endswith(".inkatlas")
+            and "tarotbig" in p.rsplit("\\", 1)[-1]
+        )
 
     # --------------------------------------------------------------- journal
 
@@ -509,11 +609,8 @@ class DatasetBuilder:
             elif t == "gameJournalInternetPage":
                 add("internet_page", node, path, str(nid or ""), "",
                     {"address": node.get("address") or ""})
-                # texts are child gameJournalInternetText in a `texts` array;
-                # walk both it and entries for structure
-                for child in node.get("texts") or []:
-                    if isinstance(child, dict):
-                        walk_entry(child, path, seen)
+                for child in self._page_children(node):
+                    walk_entry(child, path, seen)
                 walk_folder(node, path, seen)
             elif t == "gameJournalInternetText":
                 body = self.loc.text(locstr_key(node.get("text")))
@@ -526,6 +623,10 @@ class DatasetBuilder:
                 extra = {}
                 if link and not isinstance(link, dict):
                     extra["link"] = str(link)
+                image = self._atlas_key(node.get("textureAtlas"),
+                                        node.get("texturePart"))
+                if image:
+                    extra["image"] = image
                 add("internet_image", node, path,
                     str(name) if name and not isinstance(name, dict) else str(nid or ""),
                     "", extra or None)
@@ -538,7 +639,8 @@ class DatasetBuilder:
                 addressee = self.loc.text(locstr_key(node.get("addressee")))
                 body = self.loc.text(locstr_key(node.get("content")))
                 add("email", node, path, title, body,
-                    {"sender": sender, "addressee": addressee})
+                    self._with_image({"sender": sender, "addressee": addressee},
+                                     node.get("pictureTweak")))
             elif t == "gameJournalPhoneConversation":
                 title = self.loc.text(locstr_key(node.get("title")))
                 add("phone_conversation", node, path, title or str(nid or ""), "")
@@ -567,7 +669,11 @@ class DatasetBuilder:
                 walk_folder(node, path, seen)
             elif t == "gameJournalCodexEntry":
                 title = self.loc.text(locstr_key(node.get("title")))
-                add("codex_entry", node, path, title, "")
+                extra = self._with_image({}, node.get("imageId"))
+                thumb = self._icon_key(node.get("linkImageId"))
+                if thumb:
+                    extra["thumb"] = thumb
+                add("codex_entry", node, path, title, "", extra or None)
                 walk_folder(node, path, seen)
             elif t == "gameJournalCodexDescription":
                 sub = self.loc.text(locstr_key(node.get("subTitle")))
@@ -579,15 +685,22 @@ class DatasetBuilder:
                 name = self.loc.text(locstr_key(node.get("name")))
                 body = self.loc.text(locstr_key(node.get("description")))
                 index = node.get("index")
-                add("tarot", node, path, name, body,
-                    {"index": index} if isinstance(index, int) else None)
+                extra = {"index": index} if isinstance(index, int) else {}
+                card = self._tarot_key(node.get("imagePart"), str(nid or ""))
+                if card:
+                    extra["image"] = card
+                add("tarot", node, path, name, body, extra or None)
             elif t == "gameJournalContact":
                 name = self.loc.text(locstr_key(node.get("name")))
                 contact_type = node.get("type")
                 extra = ({"contact_type": str(contact_type)}
                          if contact_type and not isinstance(contact_type, dict)
-                         else None)
-                add("contact", node, path, name or str(nid or ""), "", extra)
+                         else {})
+                avatar = self._icon_key(node.get("avatarID"))
+                if avatar:
+                    extra["avatar"] = avatar
+                add("contact", node, path, name or str(nid or ""), "",
+                    extra or None)
                 walk_folder(node, path, seen)
             elif t == "gameJournalFileGroup":
                 add("file_group", node, path, str(nid or ""), "")
@@ -596,8 +709,9 @@ class DatasetBuilder:
                 title = self.loc.text(locstr_key(node.get("title")))
                 body = self.loc.text(locstr_key(node.get("content")))
                 video = node.get("videoResource")
+                extra = {"video": video} if isinstance(video, str) and video else {}
                 add("file", node, path, title, body,
-                    {"video": video} if isinstance(video, str) and video else None)
+                    self._with_image(extra, node.get("pictureTweak")))
             elif t == "gameJournalOnscreenGroup":
                 add("onscreen_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
@@ -605,8 +719,9 @@ class DatasetBuilder:
                 title = self.loc.text(locstr_key(node.get("title")))
                 desc = self.loc.text(locstr_key(node.get("description")))
                 overrides = self._override_texts(node)
+                extra = {"variants": overrides} if overrides else {}
                 add("onscreen", node, path, title, desc,
-                    {"variants": overrides} if overrides else None)
+                    self._with_image(extra, node.get("iconID")))
             elif t == "gameJournalBriefing":
                 add("briefing", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
@@ -614,7 +729,11 @@ class DatasetBuilder:
                 add("briefing_video", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
             elif t == "gameJournalImageEntry":
-                add("image", node, path, str(nid or ""), "")
+                extra = self._with_image({}, node.get("imageId"))
+                thumb = self._icon_key(node.get("thumbnailImageId"))
+                if thumb:
+                    extra["thumb"] = thumb
+                add("image", node, path, str(nid or ""), "", extra or None)
             elif t == "gameJournalPointOfInterestGroup":
                 add("poi_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
@@ -676,6 +795,47 @@ class DatasetBuilder:
             rows,
         )
         print(f"subtitles: {n}")
+
+    # ---------------------------------------------------------------- images
+
+    def _build_images(self, con: sqlite3.Connection) -> None:
+        """Decode every atlas part the journal referenced into `images`.
+
+        Crops are grouped by texture so each 4K bitmap is decoded once; a
+        part the atlas no longer carries is reported and skipped, not fatal.
+        """
+        if not self.images:
+            print(f"images: skipped ({len(self.image_keys)} referenced)")
+            return
+        by_texture: dict[str, list[tuple[str, str, str]]] = {}
+        missing = []
+        for key in sorted(self.image_keys):
+            atlas, _, part = key.partition("#")
+            try:
+                texture = self.textures.part(atlas, part).texture
+            except (TextureError, ArchiveError) as e:
+                missing.append(f"{key}: {e}")
+                continue
+            by_texture.setdefault(texture, []).append((key, atlas, part))
+        rows = []
+        for texture in sorted(by_texture):
+            for key, atlas, part in by_texture[texture]:
+                try:
+                    data, width, height = encode_image(self.textures.crop(atlas, part))
+                except (TextureError, ArchiveError, OSError, ValueError) as e:
+                    missing.append(f"{key}: {e}")
+                    continue
+                rows.append((key, width, height, IMAGE_FORMAT, data))
+        rows.sort(key=lambda r: r[0])
+        con.executemany(
+            "INSERT INTO images (key, width, height, format, data)"
+            " VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        for line in missing:
+            print(f"images: skipped {line}", file=sys.stderr)
+        total = sum(len(r[4]) for r in rows)
+        print(f"images: {len(rows)} ({total / 1e6:.1f} MB, {len(missing)} skipped)")
 
     # ------------------------------------------------------------------- fts
 
@@ -769,6 +929,14 @@ CREATE TABLE subtitles (
 );
 CREATE INDEX idx_subtitles_file ON subtitles (file_path);
 
+CREATE TABLE images (
+    key TEXT PRIMARY KEY,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    format TEXT NOT NULL,
+    data BLOB NOT NULL
+);
+
 CREATE VIEW v_items AS
 SELECT
     r.source,
@@ -810,7 +978,12 @@ SELECT
     (SELECT json_extract(ip.extra, '$.address') FROM journal ip
       WHERE ip.id = p.id) AS address,
     COUNT(*) AS text_count,
-    group_concat(NULLIF(j.body, ''), char(10) || char(10)) AS body
+    group_concat(NULLIF(j.body, ''), char(10) || char(10)) AS body,
+    (SELECT group_concat(json_extract(i.extra, '$.image'), char(10))
+       FROM (SELECT i.extra FROM journal i
+              WHERE i.kind = 'internet_image' AND i.source = j.source
+                AND i.path = j.path AND json_extract(i.extra, '$.image') IS NOT NULL
+              ORDER BY i.id) i) AS images
 FROM journal j
 JOIN journal p ON p.path = j.path AND p.kind = 'internet_page' AND p.source = j.source
 WHERE j.kind = 'shard_text'
@@ -856,6 +1029,8 @@ SELECT
       WHERE c.kind = 'codex_section' AND c.source = e.source
         AND e.path LIKE c.path || '/%'
       ORDER BY length(c.path) DESC LIMIT 1) AS section,
+    json_extract(e.extra, '$.image') AS image,
+    json_extract(e.extra, '$.thumb') AS thumb,
     d.extra
 FROM journal d
 JOIN journal e ON e.kind = 'codex_entry' AND e.source = d.source
@@ -874,7 +1049,8 @@ SELECT
     j.title AS subject,
     json_extract(j.extra, '$.sender') AS sender,
     json_extract(j.extra, '$.addressee') AS addressee,
-    j.body
+    j.body,
+    json_extract(j.extra, '$.image') AS image
 FROM journal j
 WHERE j.kind = 'email';
 
@@ -886,6 +1062,7 @@ SELECT
     c.entry_id AS contact_id,
     c.title AS name,
     json_extract(c.extra, '$.contact_type') AS contact_type,
+    json_extract(c.extra, '$.avatar') AS avatar,
     (SELECT COUNT(*) FROM journal m
       WHERE m.kind = 'phone_message' AND m.source = c.source
         AND m.path LIKE c.path || '/%') AS message_count
@@ -960,7 +1137,8 @@ WHERE kind IN ('quest', 'quest_phase', 'quest_objective', 'quest_description',
                'quest_title_variant');
 
 CREATE VIEW v_tarots AS
-SELECT j.* FROM journal j WHERE kind = 'tarot';
+SELECT j.*, json_extract(j.extra, '$.image') AS image
+FROM journal j WHERE kind = 'tarot';
 
 CREATE VIEW v_vehicles AS
 SELECT

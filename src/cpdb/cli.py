@@ -40,7 +40,7 @@ def fmt_rows(rows: list[tuple], cols: list[str], wide: bool) -> str:
 
 
 #: Dataset layout this CLI speaks; kept in step with build.SCHEMA_VERSION.
-REQUIRED_SCHEMA_VERSION = 3
+REQUIRED_SCHEMA_VERSION = 4
 
 SEARCH_SOURCES = ("journal", "lockey", "subtitle")
 
@@ -166,10 +166,30 @@ def journal_entries(con: sqlite3.Connection, target: str, limit: int = 20):
     ).fetchall()
 
 
+def image_row(con: sqlite3.Connection, target: str) -> sqlite3.Row | None:
+    """An `images` row by key, or the picture of a journal entry (id or path)."""
+    row = con.execute("SELECT * FROM images WHERE key = ?", (target,)).fetchone()
+    if row is not None:
+        return row
+    for entry in journal_entries(con, target, limit=5):
+        extra = entry["extra"]
+        if not extra:
+            continue
+        keys = json.loads(extra)
+        for field in ("image", "avatar", "thumb"):
+            key = keys.get(field)
+            if key:
+                row = con.execute("SELECT * FROM images WHERE key = ?", (key,)).fetchone()
+                if row is not None:
+                    return row
+    return None
+
+
 def build_command(argv: list[str]) -> int:
     """`cpdb build <game dir> [db]` - build a dataset from a game install."""
     from .build import GAME_LANGS, BuildError, DatasetBuilder
     from .engine import ArchiveError
+    from .textures import TextureError
 
     ap = argparse.ArgumentParser(
         prog="cpdb build",
@@ -180,11 +200,14 @@ def build_command(argv: list[str]) -> int:
                     help="output SQLite file (default: ./cp2077.sqlite)")
     ap.add_argument("--lang", default="en", choices=GAME_LANGS,
                     metavar="CODE", help="onscreens language (default: en)")
+    ap.add_argument("--images", action="store_true",
+                    help="also decode the journal's pictures (needs Pillow)")
     args = ap.parse_args(argv)
     db_path = Path(args.db_path) if args.db_path else Path("cp2077.sqlite")
     try:
-        DatasetBuilder(Path(args.game_dir), db_path, args.lang).build()
-    except (BuildError, ArchiveError) as e:
+        DatasetBuilder(Path(args.game_dir), db_path, args.lang,
+                       images=args.images).build()
+    except (BuildError, ArchiveError, TextureError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     return 0
@@ -254,6 +277,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_stats = sub.add_parser("stats", help="row counts per table/view")
     p_stats.add_argument("--json", action="store_true")
+
+    p_image = sub.add_parser("image", help="write one picture to a file")
+    p_image.add_argument("key", help="images.key, or a journal id/path with a picture")
+    p_image.add_argument("out", help="output file, e.g. cover.webp")
 
     args = ap.parse_args(argv)
 
@@ -408,6 +435,15 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             print(f"exported {args.profile} dataset -> {args.dst}")
             return 0
+
+        elif args.cmd == "image":
+            row = image_row(con, args.key)
+            if row is None:
+                print(f"no picture for {args.key!r}", file=sys.stderr)
+                return 1
+            Path(args.out).write_bytes(row["data"])
+            print(f"{row['key']} {row['width']}x{row['height']} {row['format']}"
+                  f" -> {args.out}")
 
         elif args.cmd == "stats":
             names = [r[0] for r in con.execute(

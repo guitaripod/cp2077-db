@@ -11,6 +11,9 @@ requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "Marcus" }]
 
+[project.optional-dependencies]
+images = ["Pillow>=10"]
+
 [project.scripts]
 cpdb = "cpdb.cli:main"
 

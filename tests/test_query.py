@@ -25,7 +25,9 @@ JOURNAL_ROWS = [
     ("base", "shard_text", "t2", "internet_sites/n54/tower",
      "body", "Militech denies involvement in the tower raid.", None),
     ("base", "codex_entry", "c1", "codex/characters/johnny",
-     "Johnny Silverhand", "", None),
+     "Johnny Silverhand", "",
+     json.dumps({"image": "base\\gui\\codex.inkatlas#johnny_full",
+                 "thumb": "base\\gui\\codex.inkatlas#johnny"})),
     ("base", "codex_description", "c2", "codex/characters/johnny/johnny_desc",
      "", "A rockerboy engram riding in V's head.", None),
     ("ep1", "email", "e1", "onscreens/emails/quests/dogtown",
@@ -57,6 +59,18 @@ PHONE_ROWS = [
     ("base", "map_pin", "p1", "quests/main_quest/q001/p1", "p1",
      "Konpeki Plaza", None),
     ("base", "internet_site", "n54", "internet_sites/n54", "N54 News", "", None),
+    ("base", "internet_image", "logo", "internet_sites/n54/tower", "logo", "",
+     json.dumps({"image": "base\\gui\\n54.inkatlas#logo"})),
+    ("base", "tarot", "mq033_death", "tarots/mq033_death", "Death",
+     "A card about endings.",
+     json.dumps({"index": 13, "image": "base\\gui\\tarot.inkatlas#tarot_deathBIG"})),
+]
+
+IMAGE_ROWS = [
+    ("base\\gui\\codex.inkatlas#johnny_full", 1860, 609, "webp",
+     b"RIFF\x00\x00\x00\x00WEBPjohnny"),
+    ("base\\gui\\n54.inkatlas#logo", 200, 80, "webp",
+     b"RIFF\x00\x00\x00\x00WEBPlogo"),
 ]
 
 SUBTITLE_ROWS = [
@@ -81,6 +95,9 @@ def make_dataset(path: Path) -> None:
     con.executemany(
         "INSERT INTO subtitles (source, file_path, string_id, line)"
         " VALUES (?, ?, ?, ?)", SUBTITLE_ROWS)
+    con.executemany(
+        "INSERT INTO images (key, width, height, format, data)"
+        " VALUES (?, ?, ?, ?, ?)", IMAGE_ROWS)
     con.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(build.SCHEMA_VERSION),))
     for fts in ("journal_fts", "lockeys_fts", "subtitles_fts"):
@@ -237,7 +254,7 @@ class TreeTests(DatasetTestCase):
         roots = {r["path"]: r["entries"] for r in json.loads(out)}
         self.assertEqual(set(roots),
                          {"internet_sites", "codex", "onscreens", "contacts",
-                          "quests"})
+                          "quests", "tarots"})
         self.assertEqual(roots["codex"], 2)
 
     def test_descends_into_a_prefix(self):
@@ -282,6 +299,26 @@ class CuratedViewTests(DatasetTestCase):
         self.assertEqual(row["title"], "Johnny Silverhand")
         self.assertIsNone(row["subtitle"])
         self.assertIn("rockerboy engram", row["body"])
+
+    def test_codex_rows_carry_their_entry_picture_keys(self):
+        row = self.rows("SELECT * FROM v_codex")[0]
+        self.assertEqual(row["image"], "base\\gui\\codex.inkatlas#johnny_full")
+        self.assertEqual(row["thumb"], "base\\gui\\codex.inkatlas#johnny")
+        picture = self.rows(
+            "SELECT width, height, format FROM images WHERE key = ?"
+            .replace("?", "'base\\gui\\codex.inkatlas#johnny_full'"))[0]
+        self.assertEqual((picture["width"], picture["height"], picture["format"]),
+                         (1860, 609, "webp"))
+
+    def test_shards_list_their_page_pictures(self):
+        row = self.rows("SELECT images FROM v_shards WHERE page_path LIKE '%tower'")[0]
+        self.assertEqual(row["images"], "base\\gui\\n54.inkatlas#logo")
+
+    def test_tarots_and_contacts_expose_picture_keys(self):
+        tarot = self.rows("SELECT image FROM v_tarots")[0]
+        self.assertEqual(tarot["image"], "base\\gui\\tarot.inkatlas#tarot_deathBIG")
+        contact = self.rows("SELECT avatar FROM v_contacts")[0]
+        self.assertIsNone(contact["avatar"])
 
     def test_emails_expose_sender_and_addressee(self):
         row = self.rows("SELECT * FROM v_emails")[0]
@@ -354,6 +391,28 @@ class ViewTests(DatasetTestCase):
         self.assertEqual(rc, 0)
         self.assertIn("journal", out)
         self.assertIn("v_shards", out)
+        self.assertIn("images", out)
+
+
+class ImageCommandTests(DatasetTestCase):
+    def test_writes_a_picture_by_key(self):
+        out = Path(self.tmp.name) / "johnny.webp"
+        rc, text = self.run_cli("image", "base\\gui\\codex.inkatlas#johnny_full", str(out))
+        self.assertEqual(rc, 0)
+        self.assertIn("1860x609 webp", text)
+        self.assertTrue(out.read_bytes().startswith(b"RIFF"))
+
+    def test_resolves_a_journal_entry_to_its_picture(self):
+        out = Path(self.tmp.name) / "entry.webp"
+        rc, _ = self.run_cli("image", "codex/characters/johnny", str(out))
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.read_bytes().endswith(b"johnny"))
+
+    def test_entry_without_a_picture_returns_one(self):
+        out = Path(self.tmp.name) / "none.webp"
+        rc, _ = self.run_cli("image", "quests/main_quest/q001", str(out))
+        self.assertEqual(rc, 1)
+        self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":
