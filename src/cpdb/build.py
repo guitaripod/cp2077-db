@@ -1,32 +1,44 @@
 """Build the cp2077 SQLite dataset from an installed game.
 
 Inputs (all read directly from the game install):
-  * r6/cache/tweakdb.bin + tweakdb_ep1.bin (TweakDB blobs, vanilla-verified)
-  * archive/pc/content/lang_en_text.archive + archive/pc/ep1/lang_en_text.archive
+  * r6/cache/tweakdb.bin + tweakdb_ep1.bin (TweakDB blobs)
+  * archive/pc/content/lang_<lang>_text.archive + archive/pc/ep1/lang_<lang>_text.archive
     (onscreens LocKey table + subtitle files)
   * archive/pc/{content,ep1} gamedata archives: base\\journal\\cooked_journal.journal
     + ep1\\journal\\cooked_journal.journal (shards, codex, emails, ...)
   * WolvenKit hash tables (usedhashes.kark, tweakdbstr.kark) vendored under
     data/ for path and TweakDBID resolution
 
-Output: cp2077.sqlite with typed tables, curated views, and FTS5 full-text
-search over all readable text.
+Output: one SQLite file with typed tables, curated views, and FTS5 full-text
+search over all readable text. The output is deterministic: identical inputs
+produce a byte-identical file: no timestamps, stable row ordering, a fixed
+page size, and no ANALYZE statistics.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
 
 from .cr2w import read_cr2w
-from .engine import Archive, fnv1a64, kark_decompress
-from .tweakdb import parse as parse_tweakdb, tweakdbid_hash, murmur3, crc32
+from .engine import Archive, ArchiveError, fnv1a64, kark_decompress
+from .tweakdb import parse as parse_tweakdb, tweakdbid_hash, murmur3
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+
+#: Game language codes -> internal archive folder (folder name uses -).
 GAME_LANGS = ["ar", "cs", "de", "en", "es-es", "es-mx", "fr", "hu", "it", "ja",
               "ko", "pl", "pt", "ru", "th", "tr", "ua", "zh-cn", "zh-tw"]
+
+SOURCES = (("base", "content"), ("ep1", "ep1"))
+
+
+class BuildError(RuntimeError):
+    """Raised when the game install does not contain the required inputs."""
 
 
 def read_vlq(buf: bytes, pos: int) -> tuple[int, int]:
@@ -51,7 +63,6 @@ def load_tweak_names() -> dict[int, str]:
     blob = kark_decompress((DATA_DIR / "tweakdbstr.kark").read_bytes())
     id2name: dict[int, str] = {}
     pos = 20
-    n_names = 0
     while pos < len(blob):
         n, pos = read_vlq(blob, pos)
         if n > 0:
@@ -64,7 +75,6 @@ def load_tweak_names() -> dict[int, str]:
             s = ""
         if s:
             id2name.setdefault(tweakdbid_hash(s), s)
-        n_names += 1
     return id2name
 
 
@@ -95,39 +105,37 @@ class LocResolver:
         self.entries: dict[int, dict] = {}
         self._load(game_dir, used_hashes)
 
-
     def _load(self, game_dir: Path, used_hashes: dict[int, str]) -> None:
         pc = game_dir / "archive" / "pc"
-        for prefix, arch in (
-            ("base", pc / "content" / f"lang_{self.lang}_text.archive"),
-            ("ep1", pc / "ep1" / f"lang_{self.lang}_text.archive"),
-        ):
+        for prefix, folder in SOURCES:
+            arch = pc / folder / f"lang_{self.lang}_text.archive"
             if not arch.exists():
-                continue
+                raise BuildError(
+                    f"missing language archive {arch}\n"
+                    f"available languages: {' '.join(GAME_LANGS)}"
+                )
             ar = Archive(arch)
             # The language folder is discovered from the archive contents:
-            # any entry whose path ends with onscreens\\onscreens_final.json
-            # under this prefix. Archive files are en-us etc.; "en" matches
-            # lang_en_text.archive contents only.
-            path = None
-            for h in ar.files:
-                p = used_hashes.get(h)
-                if (
+            # the entry whose path ends with onscreens\\onscreens_final.json
+            # under this prefix (folder names are e.g. en-us).
+            path = next(
+                (
                     p
-                    and p.startswith(prefix + "\\localization\\")
+                    for h in ar.files
+                    for p in (used_hashes.get(h) or "",)
+                    if p.startswith(prefix + "\\localization\\")
                     and p.endswith("\\onscreens\\onscreens_final.json")
-                ):
-                    path = p
-                    break
+                ),
+                None,
+            )
             if path is None:
-                print(f"warning: no onscreens in {arch.name}", file=sys.stderr)
-                continue
+                raise BuildError(f"no onscreens found in {arch.name}")
             f = read_cr2w(ar.read_entry(fnv1a64(path.encode("utf-8"))))
             if f.root is None:
-                continue
+                raise BuildError(f"could not decode {path} in {arch.name}")
             inner = f.root.get("root")
             if not isinstance(inner, dict):
-                continue
+                raise BuildError(f"unexpected structure in {path} in {arch.name}")
             for e in inner.get("entries") or []:
                 pk = e.get("primaryKey")
                 if isinstance(pk, int):
@@ -153,26 +161,40 @@ def locstr_key(v: object) -> int | None:
     return None
 
 
-def journal_walk(node: object):
-    """Yield every dict in the decoded journal tree depth-first."""
-    stack = [node]
-    while stack:
-        n = stack.pop()
-        if isinstance(n, dict):
-            yield n
-            for v in n.values():
-                if isinstance(v, (dict, list)):
-                    stack.append(v)
-        elif isinstance(n, list):
-            for v in n:
-                stack.append(v)
+FULL_HASH_LIMIT = 64 << 20
+EDGE_HASH_SIZE = 4 << 20
+
+
+def file_identity(path: Path) -> bytes:
+    """SHA-256 of a file, or of its first and last 4 MiB when it is huge.
+
+    The multi-gigabyte archives are identified by their edges plus size: enough
+    to notice a patch or a mod swap without re-reading 20 GB on every build.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        size = f.seek(0, 2)
+        f.seek(0)
+        if size <= FULL_HASH_LIMIT:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        else:
+            h.update(f.read(EDGE_HASH_SIZE))
+            f.seek(size - EDGE_HASH_SIZE)
+            h.update(f.read(EDGE_HASH_SIZE))
+    return h.digest()
 
 
 class DatasetBuilder:
     def __init__(self, game_dir: Path, db_path: Path, lang: str = "en"):
         self.game_dir = Path(game_dir)
         self.db_path = Path(db_path)
+        if lang not in GAME_LANGS:
+            raise BuildError(
+                f"unknown language {lang!r}; one of: {' '.join(GAME_LANGS)}"
+            )
         self.lang = lang
+        self._require_inputs()
         self.used_hashes = load_used_hashes()
         self.tweak_names = load_tweak_names()
         self.record_types = load_record_types()
@@ -180,32 +202,75 @@ class DatasetBuilder:
 
     # ------------------------------------------------------------------ build
 
+    def input_files(self) -> list[Path]:
+        """Every file this build reads, for the meta fingerprint."""
+        pc = self.game_dir / "archive" / "pc"
+        files = [
+            self.game_dir / "r6" / "cache" / "tweakdb.bin",
+            self.game_dir / "r6" / "cache" / "tweakdb_ep1.bin",
+        ]
+        for prefix, folder in SOURCES:
+            files.append(pc / folder / f"lang_{self.lang}_text.archive")
+        files.append(pc / "content" / "basegame_4_gamedata.archive")
+        files.append(pc / "ep1" / "ep1_2_gamedata.archive")
+        return files
+
+    def _require_inputs(self) -> None:
+        """Fail before any work if the install lacks a file the build reads."""
+        missing = [p for p in self.input_files() if not p.is_file()]
+        if missing:
+            listed = "\n  ".join(str(p) for p in missing)
+            raise BuildError(
+                f"{self.game_dir} is missing required game files:\n  {listed}\n"
+                "expected a standard Steam/GOG Cyberpunk 2077 install "
+                f"(language {self.lang!r})"
+            )
+
+    def _fingerprint(self) -> str:
+        """SHA-256 over the content identity of every input file."""
+        h = hashlib.sha256()
+        h.update(f"cpdb-1\nlang={self.lang}\n".encode())
+        for p in self.input_files():
+            h.update(f"{p.name}:{p.stat().st_size}:".encode())
+            h.update(file_identity(p))
+            h.update(b"\n")
+        return h.hexdigest()
+
     def build(self) -> None:
         t0 = time.time()
-        if self.db_path.exists():
-            self.db_path.unlink()
-        con = sqlite3.connect(self.db_path)
-        con.executescript(SCHEMA)
-        self._build_meta(con)
-        self._build_strings(con)
-        self._build_tweakdb(con)
-        self._build_journal(con)
-        self._build_subtitles(con)
-        self._build_fts(con)
-        con.execute("ANALYZE")
-        con.commit()
-        con.close()
-        print(f"dataset built in {time.time()-t0:.1f}s -> {self.db_path}")
+        out = self.db_path
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        if tmp.exists():
+            tmp.unlink()
+        con = sqlite3.connect(tmp)
+        try:
+            # Deterministic output: fixed page size (must be set before any
+            # table is created), no run-dependent state.
+            con.execute("PRAGMA page_size = 4096")
+            con.executescript(SCHEMA)
+            self._build_meta(con)
+            self._build_strings(con)
+            self._build_tweakdb(con)
+            self._build_journal(con)
+            self._build_subtitles(con)
+            self._build_fts(con)
+            con.commit()
+            con.execute("VACUUM")
+            con.close()
+            os.replace(tmp, out)
+        except Exception:
+            con.close()
+            if tmp.exists():
+                tmp.unlink()
+            raise
+        print(f"dataset built in {time.time()-t0:.1f}s -> {out}")
 
     def _build_meta(self, con: sqlite3.Connection) -> None:
-        con.execute(
-            "INSERT INTO meta (key, value) VALUES (?, ?)",
-            ("built_at", time.strftime("%Y-%m-%dT%H:%M:%S")),
-        )
-        con.execute(
-            "INSERT INTO meta (key, value) VALUES (?, ?)",
-            ("language", self.lang),
-        )
+        for key, value in (("lang", self.lang),
+                           ("input_fingerprint", self._fingerprint())):
+            con.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)", (key, value)
+            )
 
     # --------------------------------------------------------------- strings
 
@@ -237,12 +302,12 @@ class DatasetBuilder:
         ]
         for source, path in blobs:
             if not path.exists():
-                print(f"warning: {path} missing, skipping", file=sys.stderr)
-                continue
+                raise BuildError(f"missing TweakDB blob {path}")
             db = parse_tweakdb(path.read_bytes())
             flats = []
             flat_texts = []
-            for fid, val in db.flats.items():
+            for fid in sorted(db.flats):
+                val = db.flats[fid]
                 name = self.tweak_names.get(fid)
                 if name is None:
                     continue
@@ -251,7 +316,8 @@ class DatasetBuilder:
                 if red_type == "gamedataLocKeyWrapper" and isinstance(val, int):
                     flat_texts.append((source, fid, name, str(val),
                                        self.loc.text(val)))
-                elif red_type == "String" and isinstance(val, str) and val.startswith("LocKey#"):
+                elif (red_type == "String" and isinstance(val, str)
+                      and val.startswith("LocKey#")):
                     try:
                         key = int(val[7:])
                     except ValueError:
@@ -260,16 +326,20 @@ class DatasetBuilder:
                         flat_texts.append((source, fid, name, str(key),
                                            self.loc.text(key)))
             records = []
-            for rid, tkey in db.records.items():
+            for rid in sorted(db.records):
+                tkey = db.records[rid]
                 name = self.tweak_names.get(rid)
                 tname = self.record_types.get(tkey)
                 if name is None:
                     continue
                 records.append((source, rid, name, tname))
-            queries = [
-                (source, qid, json.dumps([self.tweak_names.get(e) or hex(e) for e in ents]))
-                for qid, ents in db.queries.items()
-            ]
+            queries = []
+            for qid in sorted(db.queries):
+                ents = db.queries[qid]
+                queries.append(
+                    (source, qid,
+                     json.dumps([self.tweak_names.get(e) or hex(e) for e in ents]))
+                )
             con.executemany(
                 "INSERT INTO tweak_flats (source, flat_id, name, flat_type, value)"
                 " VALUES (?, ?, ?, ?, ?)",
@@ -309,16 +379,17 @@ class DatasetBuilder:
         n = 0
         for source, arch_path, entry_path in targets:
             if not arch_path.exists():
-                continue
+                raise BuildError(f"missing gamedata archive {arch_path}")
             ar = Archive(arch_path)
             h = fnv1a64(entry_path.encode("utf-8"))
             if h not in ar.files:
-                print(f"warning: {entry_path} not found in {arch_path.name}",
-                      file=sys.stderr)
-                continue
+                raise BuildError(
+                    f"{entry_path} not found in {arch_path.name} — is this a "
+                    "modded or non-vanilla install?"
+                )
             f = read_cr2w(ar.read_entry(h))
             if f.root is None:
-                continue
+                raise BuildError(f"could not decode {entry_path}")
             rows = self._journal_rows(f.root, source)
             con.executemany(JOURNAL_INSERT, rows)
             n += len(rows)
@@ -339,12 +410,10 @@ class DatasetBuilder:
                     parent_path,
                     title,
                     body,
-                    json.dumps(extra) if extra else None,
+                    json.dumps(extra, ensure_ascii=False) if extra else None,
                 )
             )
 
-        # First pass: index nodes by handle identity is not needed — the tree
-        # is already nested; we walk with an accumulated path from the root.
         def walk_folder(node: dict, path: str, seen: set) -> None:
             for e in node.get("entries") or []:
                 if isinstance(e, dict):
@@ -364,31 +433,25 @@ class DatasetBuilder:
                      "gameJournalFolderEntry"):
                 add("folder", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalQuest":
+            elif t == "gameJournalQuest":
                 title = self.loc.text(locstr_key(node.get("title")))
                 add("quest", node, path, title, "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalQuestPhase":
+            elif t == "gameJournalQuestPhase":
                 add("quest_phase", node, path, "", "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalQuestObjective":
+            elif t == "gameJournalQuestObjective":
                 desc = self.loc.text(locstr_key(node.get("description")))
                 add("quest_objective", node, path, str(nid or ""), desc)
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalQuestDescription":
+            elif t == "gameJournalQuestDescription":
                 desc = self.loc.text(locstr_key(node.get("description")))
                 add("quest_description", node, path, str(nid or ""), desc)
-                return
-            if t == "gameJournalInternetSite":
+            elif t == "gameJournalInternetSite":
                 name = self.loc.text(locstr_key(node.get("shortName")))
                 add("internet_site", node, path, name, "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalInternetPage":
+            elif t == "gameJournalInternetPage":
                 add("internet_page", node, path, str(nid or ""), "",
                     {"address": node.get("address") or ""})
                 # texts are child gameJournalInternetText in a `texts` array;
@@ -397,116 +460,92 @@ class DatasetBuilder:
                     if isinstance(child, dict):
                         walk_entry(child, path, seen)
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalInternetText":
+            elif t == "gameJournalInternetText":
                 body = self.loc.text(locstr_key(node.get("text")))
                 nm = node.get("name")
                 nm = str(nm) if not isinstance(nm, dict) else ""
                 add("shard_text", node, path, nm, body)
-                return
-            if t == "gameJournalInternetImage":
+            elif t == "gameJournalInternetImage":
                 add("internet_image", node, path, str(nid or ""), "")
-                return
-            if t == "gameJournalEmailGroup":
+            elif t == "gameJournalEmailGroup":
                 add("email_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalEmail":
+            elif t == "gameJournalEmail":
                 title = self.loc.text(locstr_key(node.get("title")))
                 sender = self.loc.text(locstr_key(node.get("sender")))
                 addressee = self.loc.text(locstr_key(node.get("addressee")))
                 body = self.loc.text(locstr_key(node.get("content")))
                 add("email", node, path, title, body,
                     {"sender": sender, "addressee": addressee})
-                return
-            if t == "gameJournalPhoneConversation":
+            elif t == "gameJournalPhoneConversation":
                 add("phone_conversation", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalPhoneMessage":
+            elif t == "gameJournalPhoneMessage":
                 body = self.loc.text(locstr_key(node.get("text")))
                 sender = node.get("sender") or ""
                 add("phone_message", node, path, "", body, {"sender": str(sender)})
-                return
-            if t == "gameJournalPhoneChoiceGroup":
+            elif t == "gameJournalPhoneChoiceGroup":
                 add("phone_choice_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalPhoneChoiceEntry":
+            elif t == "gameJournalPhoneChoiceEntry":
                 body = self.loc.text(locstr_key(node.get("text")))
                 add("phone_choice", node, path, "", body)
-                return
-            if t == "gameJournalCodexCategory" or t == "gameJournalCodexGroup":
+            elif t in ("gameJournalCodexCategory", "gameJournalCodexGroup"):
                 name = self.loc.text(locstr_key(
                     node.get("categoryName") or node.get("groupName")))
                 add("codex_section", node, path, name, "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalCodexEntry":
+            elif t == "gameJournalCodexEntry":
                 title = self.loc.text(locstr_key(node.get("title")))
                 add("codex_entry", node, path, title, "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalCodexDescription":
+            elif t == "gameJournalCodexDescription":
                 sub = self.loc.text(locstr_key(node.get("subTitle")))
                 body = self.loc.text(locstr_key(node.get("textContent")))
                 add("codex_description", node, path, sub, body)
-                return
-            if t == "gameJournalTarot":
+            elif t == "gameJournalTarot":
                 name = self.loc.text(locstr_key(node.get("name")))
                 body = self.loc.text(locstr_key(node.get("description")))
                 add("tarot", node, path, name, body)
-                return
-            if t == "gameJournalContact":
+            elif t == "gameJournalContact":
                 add("contact", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalFileGroup":
+            elif t == "gameJournalFileGroup":
                 add("file_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalFile":
+            elif t == "gameJournalFile":
                 title = self.loc.text(locstr_key(node.get("title")))
                 body = self.loc.text(locstr_key(node.get("content")))
                 add("file", node, path, title, body)
-                return
-            if t == "gameJournalOnscreenGroup":
+            elif t == "gameJournalOnscreenGroup":
                 add("onscreen_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalOnscreen":
+            elif t == "gameJournalOnscreen":
                 title = self.loc.text(locstr_key(node.get("title")))
                 desc = self.loc.text(locstr_key(node.get("description")))
                 add("onscreen", node, path, title, desc)
-                return
-            if t == "gameJournalBriefing":
+            elif t == "gameJournalBriefing":
                 add("briefing", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalBriefingVideoSection":
+            elif t == "gameJournalBriefingVideoSection":
                 add("briefing_video", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalImageEntry":
+            elif t == "gameJournalImageEntry":
                 add("image", node, path, str(nid or ""), "")
-                return
-            if t == "gameJournalPointOfInterestGroup":
+            elif t == "gameJournalPointOfInterestGroup":
                 add("poi_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
-                return
-            if t == "gameJournalPointOfInterestMappin":
+            elif t == "gameJournalPointOfInterestMappin":
                 add("poi", node, path, str(nid or ""), "")
-                return
-            if t == "gameJournalQuestCodexLink":
+            elif t == "gameJournalQuestCodexLink":
                 add("quest_codex_link", node, path, str(nid or ""), "")
-                return
-            if t == "gameJournalQuestMapPin":
+            elif t == "gameJournalQuestMapPin":
                 add("map_pin", node, path, str(nid or ""), "")
-                return
-            if t == "gameJournalPath":
-                return
-            # unknown: still record folders so nothing readable is silently lost
-            walk_folder(node, path, seen)
+            elif t == "gameJournalPath":
+                pass
+            else:
+                # Unknown entry class: descend so nothing readable is lost.
+                walk_folder(node, path, seen)
 
         root_node = root.get("entry") or {}
         walk_folder(root_node, "", set())
@@ -517,14 +556,12 @@ class DatasetBuilder:
     def _build_subtitles(self, con: sqlite3.Connection) -> None:
         pc = self.game_dir / "archive" / "pc"
         n = 0
-        for prefix, arch in (
-            ("base", pc / "content" / f"lang_{self.lang}_text.archive"),
-            ("ep1", pc / "ep1" / f"lang_{self.lang}_text.archive"),
-        ):
+        for prefix, folder in SOURCES:
+            arch = pc / folder / f"lang_{self.lang}_text.archive"
             if not arch.exists():
-                continue
+                raise BuildError(f"missing language archive {arch}")
             ar = Archive(arch)
-            for h in ar.files:
+            for h in sorted(ar.files):
                 path = self.used_hashes.get(h)
                 if not path or "\\subtitles\\" not in path:
                     continue
@@ -535,9 +572,8 @@ class DatasetBuilder:
                 for e in inner.get("entries") or []:
                     if not isinstance(e, dict):
                         continue
-                    body = (e.get("femaleVariant") or e.get("maleVariant") or "").replace(
-                        "\\n", "\n"
-                    )
+                    body = (e.get("femaleVariant")
+                            or e.get("maleVariant") or "").replace("\\n", "\n")
                     con.execute(
                         "INSERT INTO subtitles (source, file_path, string_id, line)"
                         " VALUES (?, ?, ?, ?)",
@@ -550,26 +586,16 @@ class DatasetBuilder:
 
     def _build_fts(self, con: sqlite3.Connection) -> None:
         con.executescript(FTS_SCHEMA)
-        con.execute(
-            "INSERT INTO journal_fts(journal_fts)"
-            " SELECT 'rebuild' WHERE EXISTS (SELECT 1 FROM journal WHERE body != '' OR title != '')"
-        )
-        con.execute(
-            "INSERT INTO lockeys_fts(lockeys_fts)"
-            " SELECT 'rebuild' WHERE EXISTS (SELECT 1 FROM lockeys)"
-        )
-        con.execute(
-            "INSERT INTO subtitles_fts(subtitles_fts)"
-            " SELECT 'rebuild' WHERE EXISTS (SELECT 1 FROM subtitles)"
-        )
+        for fts in ("journal_fts", "lockeys_fts", "subtitles_fts"):
+            con.execute(f"INSERT INTO {fts}({fts}) VALUES ('rebuild')")
         print("fts: rebuilt")
 
 
 def flat_value_json(val: object) -> str:
-    """Serialize a flat value: LocKey ints resolved later by views; keep raw."""
+    """Serialize a flat value; tuples (colors/vectors) become JSON arrays."""
     if isinstance(val, tuple):
-        return json.dumps(list(val))
-    return json.dumps(val)
+        return json.dumps(list(val), separators=(",", ":"))
+    return json.dumps(val, separators=(",", ":"))
 
 
 JOURNAL_INSERT = (
@@ -661,8 +687,8 @@ SELECT
     j.source,
     j.path AS page_path,
     p.title AS page_title,
-    group_concat(j.title, '\n') AS section_titles,
-    group_concat(NULLIF(j.body, ''), '\n\n') AS body
+    group_concat(j.title, '\\n') AS section_titles,
+    group_concat(NULLIF(j.body, ''), '\\n\\n') AS body
 FROM journal j
 JOIN journal p ON p.path = j.path AND p.kind = 'internet_page' AND p.source = j.source
 WHERE j.kind = 'shard_text'
@@ -733,10 +759,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("game_dir", help="Cyberpunk 2077 install directory")
     ap.add_argument("db_path", help="output SQLite file")
-    ap.add_argument("--lang", default="en", help="onscreens language (default: en)")
+    ap.add_argument("--lang", default="en",
+                    choices=GAME_LANGS,
+                    help="onscreens language (default: en)")
     args = ap.parse_args()
-    builder = DatasetBuilder(Path(args.game_dir), Path(args.db_path), args.lang)
-    builder.build()
+    try:
+        builder = DatasetBuilder(Path(args.game_dir), Path(args.db_path),
+                                 args.lang)
+        builder.build()
+    except (BuildError, ArchiveError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -37,7 +37,35 @@ def fmt_rows(rows: list[tuple], cols: list[str], wide: bool) -> str:
     return f"{head}\n{sep}\n{body}"
 
 
+def build_command(argv: list[str]) -> int:
+    """`cpdb build <game dir> [db]` - build a dataset from a game install."""
+    from .build import GAME_LANGS, BuildError, DatasetBuilder
+    from .engine import ArchiveError
+
+    ap = argparse.ArgumentParser(
+        prog="cpdb build",
+        description="Build a cp2077-db dataset from an installed game.",
+    )
+    ap.add_argument("game_dir", help="Cyberpunk 2077 install directory")
+    ap.add_argument("db_path", nargs="?", default=None,
+                    help="output SQLite file (default: ./cp2077.sqlite)")
+    ap.add_argument("--lang", default="en", choices=GAME_LANGS,
+                    metavar="CODE", help="onscreens language (default: en)")
+    args = ap.parse_args(argv)
+    db_path = Path(args.db_path) if args.db_path else Path("cp2077.sqlite")
+    try:
+        DatasetBuilder(Path(args.game_dir), db_path, args.lang).build()
+    except (BuildError, ArchiveError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "build":
+        return build_command(argv[1:])
+
     ap = argparse.ArgumentParser(
         prog="cpdb",
         description="Query a cp2077-db dataset. Examples:\n"
@@ -48,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("db", help="path to cp2077.sqlite")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("build", help="build a dataset from a game install "
+                                 "(cpdb build <game dir> [db])")
 
     p_search = sub.add_parser("search", help="full-text search across all content")
     p_search.add_argument("query", help="FTS5 MATCH expression, e.g. 'militech' or '\"Arasaka tower\"'")
@@ -76,103 +107,114 @@ def main(argv: list[str] | None = None) -> int:
     p_stats = sub.add_parser("stats", help="row counts per table/view")
 
     args = ap.parse_args(argv)
+
     db = Path(args.db)
     if not db.exists():
-        print(f"error: {db} not found (build one with: python -m cpdb.build)",
+        print(f"error: {db} not found (build one with: cpdb build <game dir>)",
               file=sys.stderr)
         return 2
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.OperationalError as e:
+        print(f"error: cannot open {db}: {e}", file=sys.stderr)
+        return 2
     con.row_factory = sqlite3.Row
 
-    if args.cmd == "search":
-        union = (
-            "SELECT 'journal' AS src, j.rowid, jf.title, jf.body, jf.path AS ctx "
-            "FROM journal_fts jf JOIN journal j ON j.rowid = jf.rowid "
-            "WHERE journal_fts MATCH ? "
-            "UNION ALL "
-            "SELECT 'lockey' AS src, l.rowid, l.secondary_key, l.female_variant, '' "
-            "FROM lockeys_fts lf JOIN lockeys l ON l.rowid = lf.rowid "
-            "WHERE lockeys_fts MATCH ? "
-            "UNION ALL "
-            "SELECT 'subtitle' AS src, s.rowid, '', sf.line, s.file_path "
-            "FROM subtitles_fts sf JOIN subtitles s ON s.rowid = sf.rowid "
-            "WHERE subtitles_fts MATCH ? "
-            "LIMIT ?"
-        )
-        rows = con.execute(union, (args.query, args.query, args.query, args.limit)).fetchall()
-        cols = ["src", "rowid", "title", "body", "ctx"]
-        print(json.dumps([dict(zip(cols, tuple(r))) for r in rows], indent=1)
-              if args.json
-              else fmt_rows([tuple(r) for r in rows], cols, True))
+    try:
+        if args.cmd == "search":
+            union = (
+                "SELECT 'journal' AS src, j.rowid, jf.title, jf.body, jf.path AS ctx "
+                "FROM journal_fts jf JOIN journal j ON j.rowid = jf.rowid "
+                "WHERE journal_fts MATCH ? "
+                "UNION ALL "
+                "SELECT 'lockey' AS src, l.rowid, l.secondary_key, l.female_variant, '' "
+                "FROM lockeys_fts lf JOIN lockeys l ON l.rowid = lf.rowid "
+                "WHERE lockeys_fts MATCH ? "
+                "UNION ALL "
+                "SELECT 'subtitle' AS src, s.rowid, '', sf.line, s.file_path "
+                "FROM subtitles_fts sf JOIN subtitles s ON s.rowid = sf.rowid "
+                "WHERE subtitles_fts MATCH ? "
+                "LIMIT ?"
+            )
+            rows = con.execute(union, (args.query, args.query, args.query, args.limit)).fetchall()
+            cols = ["src", "rowid", "title", "body", "ctx"]
+            print(json.dumps([dict(zip(cols, tuple(r))) for r in rows], indent=1)
+                  if args.json
+                  else fmt_rows([tuple(r) for r in rows], cols, True))
 
-    elif args.cmd == "table":
-        if not args.columns:
-            cur = con.execute(f'SELECT * FROM "{args.name}" LIMIT 0')
+        elif args.cmd == "table":
+            if not args.columns:
+                cur = con.execute(f'SELECT * FROM "{args.name}" LIMIT 0')
+                cols = [d[0] for d in cur.description]
+            else:
+                cols = [c.strip() for c in args.columns.split(",")]
+            q = f'SELECT {", ".join(chr(34)+c+chr(34) for c in cols)} FROM "{args.name}"'
+            if args.where:
+                q += f" WHERE {args.where}"
+            if args.order:
+                q += f" ORDER BY {args.order}"
+            q += f" LIMIT {args.limit}"
+            rows = [tuple(r) for r in con.execute(q)]
+            if args.json:
+                print(json.dumps([dict(zip(cols, r)) for r in rows], indent=1))
+            else:
+                print(fmt_rows(rows, cols, args.wide))
+
+        elif args.cmd == "sql":
+            cur = con.execute(args.query)
             cols = [d[0] for d in cur.description]
-        else:
-            cols = [c.strip() for c in args.columns.split(",")]
-        q = f'SELECT {", ".join(chr(34)+c+chr(34) for c in cols)} FROM "{args.name}"'
-        if args.where:
-            q += f" WHERE {args.where}"
-        if args.order:
-            q += f" ORDER BY {args.order}"
-        q += f" LIMIT {args.limit}"
-        rows = [tuple(r) for r in con.execute(q)]
-        if args.json:
-            print(json.dumps([dict(zip(cols, r)) for r in rows], indent=1))
-        else:
-            print(fmt_rows(rows, cols, args.wide))
-
-    elif args.cmd == "sql":
-        cur = con.execute(args.query)
-        cols = [d[0] for d in cur.description]
-        rows = [tuple(r) for r in cur.fetchall()]
-        if args.json:
-            print(json.dumps([dict(zip(cols, r)) for r in rows], indent=1))
-        else:
-            print(fmt_rows(rows, cols, args.wide))
-
-    elif args.cmd == "item":
-        row = con.execute(
-            "SELECT * FROM v_items WHERE record_name = ? LIMIT 1",
-            (args.record_name,),
-        ).fetchone()
-        if row is None:
-            # fall back to raw flats
-            rows = con.execute(
-                "SELECT name, flat_type, value, text FROM tweak_flats f "
-                "LEFT JOIN tweak_flat_texts t ON t.flat_id = f.flat_id AND t.source = f.source "
-                "WHERE f.name LIKE ? ORDER BY f.name",
-                (args.record_name + ".%",),
-            ).fetchall()
-            if not rows:
-                print(f"no record {args.record_name}", file=sys.stderr)
-                return 1
+            rows = [tuple(r) for r in cur.fetchall()]
             if args.json:
-                print(json.dumps([dict(r) for r in rows], indent=1))
+                print(json.dumps([dict(zip(cols, r)) for r in rows], indent=1))
             else:
-                for r in rows:
-                    val = r["text"] if r["text"] else r["value"]
-                    if r["flat_type"] == "gamedataLocKeyWrapper":
-                        val = f"{val}  ({r['value']})"
-                    print(f"{r['name']}  =  {val}")
-        else:
-            if args.json:
-                print(json.dumps(dict(row), indent=1))
-            else:
-                for k in row.keys():
-                    print(f"{k}: {row[k]}")
+                print(fmt_rows(rows, cols, args.wide))
 
-    elif args.cmd == "stats":
-        names = [r[0] for r in con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%' ORDER BY name")]
-        for n in names:
-            cnt = con.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0]
-            print(f"{n:20s} {cnt:>10d}")
-        print()
-        for v in VIEWS:
-            cnt = con.execute(f'SELECT COUNT(*) FROM "{v}"').fetchone()[0]
-            print(f"{v:20s} {cnt:>10d}")
+        elif args.cmd == "item":
+            row = con.execute(
+                "SELECT * FROM v_items WHERE record_name = ? LIMIT 1",
+                (args.record_name,),
+            ).fetchone()
+            if row is None:
+                # fall back to raw flats
+                rows = con.execute(
+                    "SELECT name, flat_type, value, text FROM tweak_flats f "
+                    "LEFT JOIN tweak_flat_texts t ON t.flat_id = f.flat_id AND t.source = f.source "
+                    "WHERE f.name LIKE ? ORDER BY f.name",
+                    (args.record_name + ".%",),
+                ).fetchall()
+                if not rows:
+                    print(f"no record {args.record_name}", file=sys.stderr)
+                    return 1
+                if args.json:
+                    print(json.dumps([dict(r) for r in rows], indent=1))
+                else:
+                    for r in rows:
+                        val = r["text"] if r["text"] else r["value"]
+                        if r["flat_type"] == "gamedataLocKeyWrapper":
+                            val = f"{val}  ({r['value']})"
+                        print(f"{r['name']}  =  {val}")
+            else:
+                if args.json:
+                    print(json.dumps(dict(row), indent=1))
+                else:
+                    for k in row.keys():
+                        print(f"{k}: {row[k]}")
+
+        elif args.cmd == "stats":
+            names = [r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%' ORDER BY name")]
+            for n in names:
+                cnt = con.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0]
+                print(f"{n:20s} {cnt:>10d}")
+            print()
+            for v in VIEWS:
+                cnt = con.execute(f'SELECT COUNT(*) FROM "{v}"').fetchone()[0]
+                print(f"{v:20s} {cnt:>10d}")
+    except sqlite3.Error as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    finally:
+        con.close()
 
     return 0
 

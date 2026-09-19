@@ -2,21 +2,31 @@
 
 Implements enough of the CR2W container + RedPackage CVariable serialization
 (WolvenKit.RED4/Archive/IO/CR2WReader.cs, GPL-3.0) to decode JsonResource files
-holding localizationPersistenceOnScreenEntries / SubtitleEntries, without a
-full RTTI registry: the serialized variables are self-describing
-(name CName, type CName, u32 size), so unknown types can be skipped by size.
-
-Only the flat value types used by these resources are supported: CName, String,
-LocalizationString, TweakDBID, CHandle (as opaque handle id), arrays of the
-above, and small numeric fundamentals.
+holding localizationPersistenceOnScreenEntries / SubtitleEntries and the
+gameJournalResource tree, without a full RTTI registry: the serialized
+variables are self-describing (name CName, type CName, u32 size), so unknown
+types are skipped by declared size, matching WolvenKit's ReadVariable policy
+(rewind to dataStart+size, continue).
 """
 from __future__ import annotations
 
+import re
 import struct
+
+from cpdb.enum_names import ENUM_NAMES
 
 CR2W_MAGIC = 0x57325243  # "CR2W" LE u32
 FNV_BASIS = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
+
+CR2W_MIN_VERSION = 163
+CR2W_MAX_VERSION = 195
+
+CLASS_RE = re.compile(r"^[a-z][A-Za-z0-9_]*$")
+
+
+class CR2WError(ValueError):
+    """Raised for malformed CR2W containers."""
 
 
 def fnv1a64(data: bytes) -> int:
@@ -40,7 +50,7 @@ class _Reader:
     def read(self, n: int) -> bytes:
         b = self.data[self.pos : self.pos + n]
         if len(b) != n:
-            raise ValueError(f"short read at {self.pos}")
+            raise CR2WError(f"short read at {self.pos}: wanted {n}, got {len(b)}")
         self.pos += n
         return b
 
@@ -74,16 +84,17 @@ class CR2WFile:
         self.imports: list[str] = []
         self.exports: list[dict] = []          # className, dataSize, dataOffset
         self.root: dict | None = None
+        self.unread_variables: list[str] = []  # "Type.name" diagnostics
 
 
 def read_cr2w(data: bytes) -> CR2WFile:
     r = _Reader(data)
     if r.u32() != CR2W_MAGIC:
-        raise ValueError("not a CR2W file")
+        raise CR2WError("not a CR2W file")
     f = CR2WFile()
     version = r.u32()
-    if not 163 <= version <= 195:
-        raise ValueError(f"unsupported CR2W version {version}")
+    if not CR2W_MIN_VERSION <= version <= CR2W_MAX_VERSION:
+        raise CR2WError(f"unsupported CR2W version {version}")
     f.version = version
     r.read(4)          # flags
     r.u64()             # timeStamp
@@ -98,12 +109,15 @@ def read_cr2w(data: bytes) -> CR2WFile:
         offset, count, _crc = struct.unpack("<III", r.read(12))
         tables.append((offset, count))
 
-    # table 0: string dict (offset-relative positions)
+    # table 0: string dict (offset-relative positions). Empty strings read
+    # as "None", matching WolvenKit's ReadStringDict.
     str_off, str_len = tables[0]
     p = str_off
     end = str_off + str_len
     while p < end:
-        zero = data.index(b"\x00", p)
+        zero = data.find(b"\x00", p, end)
+        if zero < 0:
+            raise CR2WError("unterminated string in string table")
         s = data[p:zero].decode("utf-8")
         f.strings[p - str_off] = s if s else "None"
         p = zero + 1
@@ -113,7 +127,10 @@ def read_cr2w(data: bytes) -> CR2WFile:
     r.seek(off)
     for _ in range(count):
         so, _h = struct.unpack("<II", r.read(8))
-        f.names.append(f.strings[so])
+        try:
+            f.names.append(f.strings[so])
+        except KeyError:
+            raise CR2WError(f"name offset {so:#x} outside string table") from None
 
     # table 2: imports (u32 offset, u16 className, u16 flags)
     off, count = tables[2]
@@ -130,6 +147,8 @@ def read_cr2w(data: bytes) -> CR2WFile:
         cname, objflags, parent, dsize, doffset, template, _crc = struct.unpack(
             "<HHIIIII", r.read(24)
         )
+        if cname >= len(f.names):
+            raise CR2WError(f"export class name index {cname} out of range")
         f.exports.append(
             {"className": f.names[cname], "dataSize": dsize, "dataOffset": doffset}
         )
@@ -142,6 +161,7 @@ def read_cr2w(data: bytes) -> CR2WFile:
     _resolve_handles(chunks)
     f.root = chunks[0] if chunks else None
     return f
+
 
 def _resolve_handles(chunks: list) -> None:
     """Replace {"$handle": n} markers with the decoded chunk payloads.
@@ -162,6 +182,7 @@ def _resolve_handles(chunks: list) -> None:
     for c in chunks:
         for k, v in list(c.items()):
             c[k] = resolve(v)
+
 
 def _read_lp_string(r: _Reader) -> str:
     """CR2W uses ReadLengthPrefixedString: VLQ len, + = UTF-16LE, - = UTF-8."""
@@ -184,6 +205,13 @@ def _read_lp_string(r: _Reader) -> str:
 
 
 def _read_value(r: _Reader, f: CR2WFile, red_type: str, size: int):
+    """Decode one variable value; raise ValueError for unsupported types.
+
+    Callers recover by skipping `size` bytes (the declared payload size),
+    which keeps the stream aligned exactly like WolvenKit's ReadVariable.
+    """
+    if red_type == "TweakDBID":
+        return r.u64()
     if red_type == "CName":
         idx = r.u16()
         return _CName(f.names[idx]) if idx < len(f.names) else None
@@ -196,14 +224,17 @@ def _read_value(r: _Reader, f: CR2WFile, red_type: str, size: int):
         return r.u64()
     if red_type == "ResourcePath":
         return r.u64()
-    if red_type == "CResourceAsyncReference":
-        return r.u16()
-    if red_type == "CResourceReference":
-        return r.u16()
+    # Resource references are u16 one-based indices into the imports table
+    # (0 = null), per Red4Reader.ReadCResourceReference /
+    # ReadCResourceAsyncReference, including the raRef: form.
+    if red_type in ("CResourceAsyncReference", "CResourceReference",
+                    "raRef:CResource") or red_type.startswith("raRef:"):
+        idx = r.u16()
+        if idx == 0:
+            return None
+        return f.imports[idx - 1] if idx <= len(f.imports) else None
     if red_type.startswith("handle:") or red_type.startswith("whandle:"):
         return {"$handle": r.i32() - 1}
-    if red_type == "raRef:CResource":
-        return r.u64()
     if red_type == "NodeRef":
         return _read_lp_string(r)
     if red_type == "Color":
@@ -242,6 +273,8 @@ def _read_value(r: _Reader, f: CR2WFile, red_type: str, size: int):
     if red_type.startswith("array:"):
         inner = red_type[len("array:"):]
         count = r.u32()
+        if count > 1_000_000:
+            raise ValueError(f"implausible array count {count}")
         return [_read_value(r, f, inner, 0) for _ in range(count)]
     if red_type.startswith("static:"):
         # static array: static:[n; inner]
@@ -249,22 +282,13 @@ def _read_value(r: _Reader, f: CR2WFile, red_type: str, size: int):
         n_str, inner = rest.split(";", 1)
         r.u32()
         return [_read_value(r, f, inner, 0) for _ in range(int(n_str.strip("[]")))]
-    if CLASS_RE.match(red_type) and red_type not in ENUM_NAMES:
+    if red_type not in ENUM_NAMES and CLASS_RE.match(red_type):
         return _read_class_value(r, f, red_type)
-    if CLASS_RE.match(red_type):
+    if red_type in ENUM_NAMES or CLASS_RE.match(red_type):
         # enum value: u16 index into the name table
         idx = r.u16()
         return _CName(f.names[idx]) if idx < len(f.names) else idx
-    return r.u16()
-
-
-import re as _re
-
-from cpdb.enum_names import ENUM_NAMES
-
-CLASS_RE = _re.compile(r"^[a-z][A-Za-z0-9_]*$")
-
-
+    raise ValueError(f"unsupported red type {red_type!r}")
 
 
 def _read_class_value(r: _Reader, f: CR2WFile, class_name: str) -> dict:
@@ -290,13 +314,16 @@ def _read_class_value(r: _Reader, f: CR2WFile, class_name: str) -> dict:
         except ValueError:
             r.seek(data_start + vsize)
             val = None
+            f.unread_variables.append(f"{class_name}.{var_name} ({var_type})")
         obj[var_name] = val
     return obj
+
+
 def _read_object(r: _Reader, f: CR2WFile, class_name: str, size: int) -> dict:
     """Read a CVariable chunk: [0x00] then sequence of typed variables."""
     zero = r.u8()
     if zero != 0:
-        raise ValueError(f"expected zero pad in {class_name}, got {zero}")
+        raise CR2WError(f"expected zero pad in {class_name}, got {zero}")
     obj: dict[str, object] = {"$type": class_name}
     start = r.pos
     while r.pos < start + size:
@@ -311,8 +338,9 @@ def _read_object(r: _Reader, f: CR2WFile, class_name: str, size: int) -> dict:
         try:
             val = _read_value(r, f, var_type, vsize)
         except ValueError:
-            # skip unknown type by size
+            # Skip unknown type by declared size, like WolvenKit's ReadVariable.
             r.seek(data_start + vsize)
             val = None
+            f.unread_variables.append(f"{class_name}.{var_name} ({var_type})")
         obj[var_name] = val
     return obj

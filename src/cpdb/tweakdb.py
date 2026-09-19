@@ -7,6 +7,7 @@ records (id + murmur3 type key), queries, group tags.
 from __future__ import annotations
 
 import struct
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,6 +19,9 @@ RECORDS_SEED = 0x5EEDBA5E
 FNV_BASIS = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
 
+#: Red type names for the 20 ETweakType values (WolvenKit.RED4/TweakDB/Enums.cs
+#: ETweakType order: CName, CString, TweakDBID, CResource, CFloat, CBool,
+#: CUint8..CInt64, CColor, CEulerAngles, CQuaternion, CVector2, CVector3, LocKey).
 TWEAK_TYPE_NAMES = {
     0: "CName",
     1: "String",
@@ -40,6 +44,12 @@ TWEAK_TYPE_NAMES = {
     18: "Vector3",
     19: "gamedataLocKeyWrapper",
 }
+
+MAX_REASONABLE_COUNT = 5_000_000
+
+
+class TweakDBError(ValueError):
+    """Raised for malformed TweakDB blobs."""
 
 
 def fnv1a64(data: bytes) -> int:
@@ -84,8 +94,6 @@ def murmur3(data: bytes, seed: int) -> int:
 
 def crc32(data: bytes) -> int:
     """CRC-32 (IEEE 802.3, reflected), the variant Crc32Algorithm uses."""
-    import zlib
-
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
@@ -105,7 +113,7 @@ class _Reader:
     def read(self, n: int) -> bytes:
         b = self.data[self.pos : self.pos + n]
         if len(b) != n:
-            raise ValueError(f"short read {len(b)} at {self.pos}, wanted {n}")
+            raise TweakDBError(f"short read {len(b)} at {self.pos}, wanted {n}")
         self.pos += n
         return b
 
@@ -134,6 +142,8 @@ class _Reader:
         return struct.unpack("<f", self.read(4))[0]
 
     def seek(self, pos: int) -> None:
+        if not 0 <= pos <= len(self.data):
+            raise TweakDBError(f"seek {pos} outside blob (size {len(self.data)})")
         self.pos = pos
 
     def vlq(self) -> int:
@@ -150,6 +160,8 @@ class _Reader:
                 shift += 7
                 if not (b & 0x80):
                     break
+                if shift > 34:
+                    raise TweakDBError("VLQ longer than 5 bytes")
         return -val if neg else val
 
     def lp_string(self) -> str:
@@ -168,9 +180,9 @@ class _Reader:
 @dataclass
 class FlatTypeInfo:
     type_hash: int
+    red_type: str
     value_count: int
     key_count: int
-    offset: int
 
 
 @dataclass
@@ -189,6 +201,8 @@ def _read_flat_value(r: _Reader, red_type: str) -> object:
     if red_type.startswith("array:"):
         inner = red_type[len("array:") :]
         count = r.vlq()
+        if count > MAX_REASONABLE_COUNT:
+            raise TweakDBError(f"implausible array count {count}")
         return [_read_flat_value(r, inner) for _ in range(count)]
     if red_type == "CName":
         return r.lp_string()
@@ -232,72 +246,90 @@ def _read_flat_value(r: _Reader, red_type: str) -> object:
         return (r.f32(), r.f32(), r.f32())
     if red_type == "gamedataLocKeyWrapper":
         return r.u64()
-    raise ValueError(f"unsupported flat type {red_type!r}")
+    raise TweakDBError(f"unsupported flat type {red_type!r}")
 
 
 def parse(data: bytes) -> TweakDB:
     r = _Reader(data)
     if r.u32() != TWEAKDB_MAGIC:
-        raise ValueError("not a tweakdb blob")
+        raise TweakDBError("not a tweakdb blob")
     blob_version = r.u32()
     parser_version = r.u32()
     if blob_version != BLOB_VERSION or parser_version != PARSER_VERSION:
-        raise ValueError(
-            f"unsupported tweakdb version {blob_version}/{parser_version}"
+        raise TweakDBError(
+            f"unsupported tweakdb version {blob_version}/{parser_version} "
+            f"(expected {BLOB_VERSION}/{PARSER_VERSION})"
         )
     checksum = r.u32()
-    flats_offset = r.i32()
-    records_offset = r.i32()
-    queries_offset = r.i32()
-    group_tags_offset = r.i32()
+    offsets = (r.i32(), r.i32(), r.i32(), r.i32())
+    if not all(32 <= o <= len(data) for o in offsets):
+        raise TweakDBError(f"section offsets {offsets} outside blob")
+    if offsets != tuple(sorted(offsets)):
+        raise TweakDBError(f"section offsets not ascending: {offsets}")
     db = TweakDB(checksum=checksum)
-    _read_flats(r, flats_offset, db)
-    _read_records(r, records_offset, db)
-    _read_queries(r, queries_offset, db)
-    _read_group_tags(r, group_tags_offset, db)
+    _read_flats(r, offsets[0], db)
+    _read_records(r, offsets[1], db)
+    _read_queries(r, offsets[2], db)
+    _read_group_tags(r, offsets[3], db)
     return db
 
 
 def _read_flats(r: _Reader, offset: int, db: TweakDB) -> None:
     r.seek(offset)
     num_types = r.i32()
+    if not 0 < num_types <= len(TWEAK_TYPE_NAMES) * 2:
+        raise TweakDBError(f"implausible flat type count {num_types}")
     type_infos = []
     for _ in range(num_types):
         type_hash = r.u64()
         value_count = r.u32()
         key_count = r.u32()
         type_offset = r.u32()
+        if not 0 < type_offset <= len(r.data):
+            raise TweakDBError(f"flat type offset {type_offset} outside blob")
         type_infos.append((type_hash, value_count, key_count, type_offset))
 
-    # Map type hash -> red type string, then decode values.
+    # Map type hash -> red type string; per-type tables are either a base type
+    # or a single-level array of it ("array:<inner>").
     hash_to_redtype = {}
-    for idx, name in TWEAK_TYPE_NAMES.items():
-        hash_to_redtype[fnv1a64(name.encode("ascii"))] = name
-        hash_to_redtype[fnv1a64(f"array:{name}".encode("ascii"))] = f"array:{name}"
+    for name in TWEAK_TYPE_NAMES.values():
+        for red_type_name in (name, f"array:{name}"):
+            hash_to_redtype[fnv1a64(red_type_name.encode("ascii"))] = red_type_name
 
     for type_hash, value_count, key_count, type_offset in type_infos:
         red_type = hash_to_redtype.get(type_hash)
         if red_type is None:
-            raise ValueError(f"unknown flat type hash {type_hash:#x}")
+            raise TweakDBError(f"unknown flat type hash {type_hash:#x}")
         r.seek(type_offset)
         n_values = r.u32()
+        if n_values > MAX_REASONABLE_COUNT:
+            raise TweakDBError(f"implausible value count {n_values}")
         values = []
         for _ in range(n_values):
             values.append(_read_flat_value(r, red_type))
         n_keys = r.u32()
+        if n_keys > MAX_REASONABLE_COUNT:
+            raise TweakDBError(f"implausible key count {n_keys}")
         for _ in range(n_keys):
             flat_id = r.u64()
             value_index = r.i32()
+            if not 0 <= value_index < len(values):
+                raise TweakDBError(
+                    f"flat value index {value_index} out of range "
+                    f"(type {red_type}, {len(values)} values)"
+                )
             db.flats[flat_id] = values[value_index]
             db.flat_type_by_id[flat_id] = red_type
         db.flat_types.append(
-            FlatTypeInfo(type_hash, value_count, key_count, type_offset)
+            FlatTypeInfo(type_hash, red_type, value_count, key_count)
         )
 
 
 def _read_records(r: _Reader, offset: int, db: TweakDB) -> None:
     r.seek(offset)
     n = r.i32()
+    if not 0 <= n <= MAX_REASONABLE_COUNT:
+        raise TweakDBError(f"implausible record count {n}")
     for _ in range(n):
         rid = r.u64()
         type_key = r.u32()
@@ -307,9 +339,13 @@ def _read_records(r: _Reader, offset: int, db: TweakDB) -> None:
 def _read_queries(r: _Reader, offset: int, db: TweakDB) -> None:
     r.seek(offset)
     n = r.i32()
+    if not 0 <= n <= MAX_REASONABLE_COUNT:
+        raise TweakDBError(f"implausible query count {n}")
     for _ in range(n):
         qid = r.u64()
         count = r.u32()
+        if count > MAX_REASONABLE_COUNT:
+            raise TweakDBError(f"implausible query entry count {count}")
         entries = [r.u64() for _ in range(count)]
         db.queries[qid] = entries
 
@@ -317,6 +353,8 @@ def _read_queries(r: _Reader, offset: int, db: TweakDB) -> None:
 def _read_group_tags(r: _Reader, offset: int, db: TweakDB) -> None:
     r.seek(offset)
     n = r.i32()
+    if not 0 <= n <= MAX_REASONABLE_COUNT:
+        raise TweakDBError(f"implausible group tag count {n}")
     for _ in range(n):
         gid = r.u64()
         db.group_tags[gid] = r.u8()

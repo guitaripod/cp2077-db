@@ -35,15 +35,33 @@ pip install --user .        # installs the `cpdb` CLI
 cpdb build "/path/to/Cyberpunk 2077" cp2077.sqlite --lang en
 ```
 
-(Or without installing: `PYTHONPATH=src python -m cpdb.build <game dir> <db> [--lang XX]`.)
+(Or without installing: `PYTHONPATH=src python -m cpdb.cli build <game dir> [db] [--lang XX]`.)
 
-Requirements: the game installed with text archives present (Steam/GOG layout), ~2.5 GB free
-disk. Build time ~100 s. Other languages: `--lang de` etc. uses `lang_<code>_text.archive`
-(19 languages available in the game files).
+Requirements: the game installed with text archives present (Steam/GOG layout), ~3 GB free
+disk (the finished file is ~1.3 GB). Build time ~60 s. Other languages: `--lang de` etc. uses
+`lang_<code>_text.archive` (19 languages available in the game files).
 
 The build reads only: `r6/cache/tweakdb.bin` + `tweakdb_ep1.bin`,
 `archive/pc/{content,ep1}/lang_<lang>_text.archive`,
-`archive/pc/{content,ep1}/*_gamedata.archive`. Nothing is modified.
+`archive/pc/content/basegame_4_gamedata.archive` and
+`archive/pc/ep1/ep1_2_gamedata.archive`. Nothing is modified, and a missing input is
+reported before any work starts.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests          # parser regressions, no game needed
+CP2077_DIR="/path/to/Cyberpunk 2077" python -m unittest tests.test_build
+CPDB_SLOW=1 TMPDIR=/some/disk python -m unittest tests.test_build   # + determinism
+```
+
+`tests/test_cpdb.py` runs against synthetic buffers: FNV1A64/murmur3/TweakDBID
+vectors, VLQ decoding, the one-based `raRef` import index, skip-by-declared-size
+for unknown red types, and every malformed-archive path (junk, truncated header,
+bad version, out-of-range index or segment range, duplicate name hashes).
+`tests/test_build.py` builds from a real install and checks row counts, view
+content, FTS hits, the timestamp-free `meta` table, and — with `CPDB_SLOW=1` —
+that two independent builds are byte-identical.
 
 ## Query
 
@@ -86,6 +104,12 @@ All parsers are implemented from scratch in stdlib Python, reverse-engineered fr
 Byte-level correctness is verified during extraction: every archive entry's SHA1 is checked,
 and the CR2W/onscreens decode was validated field-for-field against WolvenKit CLI's own
 serializer.
+
+The build is deterministic and fail-fast: missing game files are reported before any work
+starts, `meta` records an input fingerprint instead of a wall-clock timestamp, unknown or
+unsupported red types are skipped by their declared size (never guessed at), and the database
+is written to a temporary file and renamed only on success — a failed build leaves no partial
+dataset behind. Two builds from the same install are byte-identical.
 
 ## Personal-use note
 
