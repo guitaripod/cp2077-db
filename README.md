@@ -11,19 +11,33 @@ views. No server, no API, no dependencies beyond Python's stdlib.
 | Table / view | Contents |
 |---|---|
 | `lockeys` | Every localization key: `loc_key`, `secondary_key`, `female_variant`, `male_variant` (70,579 rows, en) |
-| `journal` | The whole in-game journal tree: shards, codex, emails, phone messages/choices, quests, objectives, tarots, contacts, files, POIs (47,379 rows) |
+| `journal` | The whole in-game journal tree: shards, codex, emails, phone messages/choices, quests, objectives, tarots, contacts, files, map pins, POIs (47k rows) |
 | `subtitles` | Every spoken line with source file + `string_id` (109,205 rows) |
 | `tweak_records` | All TweakDB records with resolved names and types (369,552: items, vehicles, perks, and everything else) |
-| `tweak_flats` | All TweakDB flat values with their red types (6.19M) |
-| `tweak_flat_texts` | LocKey-carrying flats resolved to text (126,927) |
+| `tweak_flats` | All TweakDB flat values with their red types (6.18M) |
+| `tweak_flat_texts` | LocKey-carrying flats resolved to text (137k) |
 | `tweak_queries` | TweakDB queries (record group definitions) |
 | `journal_fts`, `lockeys_fts`, `subtitles_fts` | FTS5 indexes (bm25-ranked, 2- and 3-character prefix indexes for autocomplete) |
-| `v_shards` | Internet pages (shards) with concatenated readable text, one row per page |
-| `v_shard_texts` | Individual text widgets of shard pages |
-| `v_codex`, `v_emails`, `v_quests`, `v_tarots` | Codex, emails, quests, tarot cards |
-| `v_dialogue` | Spoken lines with the scene they belong to (`q101`, `sq027`, …) |
-| `v_items` | Items with display name + description resolved |
-| `v_vehicles`, `v_perks` | Vehicles and perks with resolved text |
+
+Curated views — each one is flat, readable and ready to render:
+
+| View | One row per | Useful columns |
+|---|---|---|
+| `v_shards` | internet page | `site_title`, `address`, `text_count`, `body` (sections joined with blank lines) |
+| `v_shard_texts` | text widget on a page | `path`, `body` |
+| `v_codex` | codex article | `section`, `title` (from the entry), `subtitle`, `body` |
+| `v_emails` | email | `subject`, `sender`, `addressee`, `body` |
+| `v_contacts` | phone contact | `name`, `contact_type`, `message_count` |
+| `v_phone` | phone message or reply | `contact`, `conversation`, `line_type`, `text`, `quest_important` |
+| `v_quests` | quest | `title`, `quest_type`, `district`, `content_assignment`, `description`, `objective_count` |
+| `v_objectives` | quest objective | `quest`, `description`, `optional`, `counter` |
+| `v_dialogue` | spoken line | `scene` (`q112_08_parade_speech`), `string_id`, `line` |
+| `v_map_pins` | map pin / POI with a caption | `caption`, `content_assignment` |
+| `v_tarots` | tarot card | `title`, `body` |
+| `v_items` | item with a display name | `display_name`, `description`, `quality`, `tags`, `record_type` |
+| `v_vehicles`, `v_perks` | vehicle / perk | resolved names and descriptions |
+| `v_flat_refs` | TweakDBID-valued flat | `flat_name` → `record_name`, `record_type` |
+| `v_codex_tree`, `v_quest_tree` | raw journal rows | the hierarchy behind the flat views |
 
 `journal.id` and `subtitles.id` are stable integer keys within a build (the build is
 deterministic, so they are stable across rebuilds of the same game version) — use them as
@@ -77,6 +91,7 @@ row counts, view content, FTS hits, the timestamp-free `meta` table, and — wit
 cpdb cp2077.sqlite search '"Arasaka tower"'              # bm25-ranked, with excerpts
 cpdb cp2077.sqlite search 'neurotox*' --source subtitle  # one index only
 cpdb cp2077.sqlite tree codex/characters                 # categories + entry counts
+cpdb cp2077.sqlite show codex/characters/quests/johnny_silverhand   # entry + its text
 cpdb cp2077.sqlite page n54/tower                        # one shard page in full
 cpdb cp2077.sqlite table v_shards --where "page_path LIKE '%n54%'" --limit 5
 cpdb cp2077.sqlite table v_items --where "display_name LIKE '%Yukimura%'"

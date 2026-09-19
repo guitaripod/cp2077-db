@@ -9,8 +9,10 @@ import sys
 from pathlib import Path
 
 VIEWS = (
-    "v_shards", "v_shard_texts", "v_codex", "v_emails", "v_quests",
-    "v_tarots", "v_dialogue", "v_items", "v_vehicles", "v_perks",
+    "v_shards", "v_shard_texts", "v_codex", "v_codex_tree", "v_emails",
+    "v_contacts", "v_phone", "v_map_pins", "v_quests", "v_objectives",
+    "v_quest_tree", "v_tarots", "v_dialogue", "v_items", "v_flat_refs",
+    "v_vehicles", "v_perks",
 )
 
 
@@ -38,7 +40,7 @@ def fmt_rows(rows: list[tuple], cols: list[str], wide: bool) -> str:
 
 
 #: Dataset layout this CLI speaks; kept in step with build.SCHEMA_VERSION.
-REQUIRED_SCHEMA_VERSION = 2
+REQUIRED_SCHEMA_VERSION = 3
 
 SEARCH_SOURCES = ("journal", "lockey", "subtitle")
 
@@ -140,6 +142,30 @@ def path_children(con: sqlite3.Connection, prefix: str) -> list[tuple]:
     return sorted(counts.items())
 
 
+def journal_entries(con: sqlite3.Connection, target: str, limit: int = 20):
+    """Journal rows for an id, an exact path, or a path fragment.
+
+    A container path (a codex entry, a quest, a phone thread) also brings back
+    its descendants, so one lookup prints the whole readable article.
+    """
+    if target.isdigit():
+        rows = con.execute(
+            "SELECT * FROM journal WHERE id = ?", (int(target),)
+        ).fetchall()
+        if rows:
+            return rows
+    exact = con.execute(
+        "SELECT * FROM journal WHERE path = ? OR path LIKE ? || '/%' "
+        "ORDER BY id LIMIT ?", (target, target, limit)
+    ).fetchall()
+    if exact:
+        return exact
+    return con.execute(
+        "SELECT * FROM journal WHERE path LIKE '%' || ? || '%' "
+        "ORDER BY length(path), id LIMIT ?", (target, limit)
+    ).fetchall()
+
+
 def build_command(argv: list[str]) -> int:
     """`cpdb build <game dir> [db]` - build a dataset from a game install."""
     from .build import GAME_LANGS, BuildError, DatasetBuilder
@@ -194,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
     p_page = sub.add_parser("page", help="print one shard/internet page in full")
     p_page.add_argument("path", help="page path or a fragment of it")
     p_page.add_argument("--json", action="store_true")
+
+    p_show = sub.add_parser("show", help="print a journal entry and its text")
+    p_show.add_argument("target", help="journal id, exact path, or path fragment")
+    p_show.add_argument("--json", action="store_true")
 
     p_tree = sub.add_parser("tree", help="journal categories under a path, with counts")
     p_tree.add_argument("path", nargs="?", default="",
@@ -255,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
 
         elif args.cmd == "page":
             rows = con.execute(
-                "SELECT source, page_path, page_title, body FROM v_shards "
+                "SELECT source, page_path, site_title, address, body FROM v_shards "
                 "WHERE page_path = ? OR page_path LIKE ? ORDER BY page_path",
                 (args.path, f"%{args.path}%"),
             ).fetchall()
@@ -267,10 +297,30 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 for row in rows:
                     print(f"=== {row['page_path']}  ({row['source']})")
-                    if row["page_title"]:
-                        print(row["page_title"])
+                    if row["site_title"]:
+                        print(f"{row['site_title']}  {row['address'] or ''}".strip())
                     print()
                     print(row["body"] or "(no text)")
+                    print()
+
+        elif args.cmd == "show":
+            rows = journal_entries(con, args.target)
+            if not rows:
+                print(f"nothing matching {args.target!r}", file=sys.stderr)
+                return 1
+            if args.json:
+                print(json.dumps([dict(r) for r in rows], indent=1))
+            else:
+                for row in rows:
+                    header = f"=== [{row['kind']}] {row['path']}"
+                    print(header)
+                    if row["title"]:
+                        print(row["title"])
+                    if row["body"]:
+                        print()
+                        print(row["body"])
+                    if row["extra"]:
+                        print(f"\n({row['extra']})")
                     print()
 
         elif args.cmd == "tree":

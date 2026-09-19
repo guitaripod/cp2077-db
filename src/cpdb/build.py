@@ -37,7 +37,7 @@ GAME_LANGS = ["ar", "cs", "de", "en", "es-es", "es-mx", "fr", "hu", "it", "ja",
 SOURCES = (("base", "content"), ("ep1", "ep1"))
 
 #: Bumped whenever the table/view layout changes in a way a consumer would see.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class BuildError(RuntimeError):
@@ -399,6 +399,39 @@ class DatasetBuilder:
             n += len(rows)
         print(f"journal: {n} rows")
 
+    def _ref_name(self, value: object) -> str:
+        """A record reference as a name: ids are resolved, names pass through.
+
+        CR2W stores these fields either as a TweakDBID hash or, for CName-typed
+        ones like `districtID`, as the name itself.
+        """
+        if isinstance(value, bool):
+            return ""
+        if isinstance(value, int) and value:
+            return self.tweak_names.get(value) or ""
+        if isinstance(value, str):
+            return value
+        return ""
+
+    def _mappin_caption(self, node: dict) -> str:
+        """The localized caption a map pin or POI shows on the map."""
+        data = node.get("mappinData")
+        if isinstance(data, dict):
+            return self.loc.text(locstr_key(data.get("localizedCaption")))
+        return ""
+
+    def _override_texts(self, node: dict) -> list[str]:
+        """Input-scheme specific rewordings of an entry's text."""
+        texts = []
+        for override in node.get("journalEntryOverrideDataList") or []:
+            if not isinstance(override, dict):
+                continue
+            text = self.loc.text(
+                locstr_key(override.get("overriddenLocalizationString")))
+            if text:
+                texts.append(text)
+        return texts
+
     def _journal_rows(self, root: dict, source: str) -> list[tuple]:
         """Walk the journal tree producing typed rows per entry class."""
         rows: list[tuple] = []
@@ -439,21 +472,39 @@ class DatasetBuilder:
                 walk_folder(node, path, seen)
             elif t == "gameJournalQuest":
                 title = self.loc.text(locstr_key(node.get("title")))
-                add("quest", node, path, title, "")
+                extra = {
+                    "quest_type": str(node.get("type") or ""),
+                    "district": self._ref_name(node.get("districtID")),
+                    "content_assignment": self._ref_name(
+                        node.get("recommendedLevelID")),
+                }
+                add("quest", node, path, title, "",
+                    {k: v for k, v in extra.items() if v})
                 walk_folder(node, path, seen)
             elif t == "gameJournalQuestPhase":
                 add("quest_phase", node, path, "", "")
                 walk_folder(node, path, seen)
             elif t == "gameJournalQuestObjective":
                 desc = self.loc.text(locstr_key(node.get("description")))
-                add("quest_objective", node, path, str(nid or ""), desc)
+                extra = {}
+                if node.get("optional"):
+                    extra["optional"] = True
+                if node.get("counter"):
+                    extra["counter"] = node.get("counter")
+                if self._ref_name(node.get("districtID")):
+                    extra["district"] = self._ref_name(node.get("districtID"))
+                add("quest_objective", node, path, str(nid or ""), desc,
+                    extra or None)
                 walk_folder(node, path, seen)
             elif t == "gameJournalQuestDescription":
                 desc = self.loc.text(locstr_key(node.get("description")))
                 add("quest_description", node, path, str(nid or ""), desc)
             elif t == "gameJournalInternetSite":
                 name = self.loc.text(locstr_key(node.get("shortName")))
-                add("internet_site", node, path, name, "")
+                main = node.get("mainPagePath")
+                extra = {"main_page": main.get("realPath")} if isinstance(
+                    main, dict) and main.get("realPath") else None
+                add("internet_site", node, path, name, "", extra)
                 walk_folder(node, path, seen)
             elif t == "gameJournalInternetPage":
                 add("internet_page", node, path, str(nid or ""), "",
@@ -470,7 +521,14 @@ class DatasetBuilder:
                 nm = str(nm) if not isinstance(nm, dict) else ""
                 add("shard_text", node, path, nm, body)
             elif t == "gameJournalInternetImage":
-                add("internet_image", node, path, str(nid or ""), "")
+                name = node.get("name")
+                link = node.get("linkAddress")
+                extra = {}
+                if link and not isinstance(link, dict):
+                    extra["link"] = str(link)
+                add("internet_image", node, path,
+                    str(name) if name and not isinstance(name, dict) else str(nid or ""),
+                    "", extra or None)
             elif t == "gameJournalEmailGroup":
                 add("email_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
@@ -482,18 +540,26 @@ class DatasetBuilder:
                 add("email", node, path, title, body,
                     {"sender": sender, "addressee": addressee})
             elif t == "gameJournalPhoneConversation":
-                add("phone_conversation", node, path, str(nid or ""), "")
+                title = self.loc.text(locstr_key(node.get("title")))
+                add("phone_conversation", node, path, title or str(nid or ""), "")
                 walk_folder(node, path, seen)
             elif t == "gameJournalPhoneMessage":
                 body = self.loc.text(locstr_key(node.get("text")))
-                sender = node.get("sender") or ""
-                add("phone_message", node, path, "", body, {"sender": str(sender)})
+                extra = {}
+                sender = node.get("sender")
+                if sender and not isinstance(sender, dict):
+                    extra["sender"] = str(sender)
+                if node.get("isQuestImportant"):
+                    extra["quest_important"] = True
+                add("phone_message", node, path, "", body, extra or None)
             elif t == "gameJournalPhoneChoiceGroup":
                 add("phone_choice_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
             elif t == "gameJournalPhoneChoiceEntry":
                 body = self.loc.text(locstr_key(node.get("text")))
-                add("phone_choice", node, path, "", body)
+                extra = ({"quest_important": True}
+                         if node.get("isQuestImportant") else None)
+                add("phone_choice", node, path, "", body, extra)
             elif t in ("gameJournalCodexCategory", "gameJournalCodexGroup"):
                 name = self.loc.text(locstr_key(
                     node.get("categoryName") or node.get("groupName")))
@@ -506,13 +572,22 @@ class DatasetBuilder:
             elif t == "gameJournalCodexDescription":
                 sub = self.loc.text(locstr_key(node.get("subTitle")))
                 body = self.loc.text(locstr_key(node.get("textContent")))
-                add("codex_description", node, path, sub, body)
+                overrides = self._override_texts(node)
+                add("codex_description", node, path, sub, body,
+                    {"variants": overrides} if overrides else None)
             elif t == "gameJournalTarot":
                 name = self.loc.text(locstr_key(node.get("name")))
                 body = self.loc.text(locstr_key(node.get("description")))
-                add("tarot", node, path, name, body)
+                index = node.get("index")
+                add("tarot", node, path, name, body,
+                    {"index": index} if isinstance(index, int) else None)
             elif t == "gameJournalContact":
-                add("contact", node, path, str(nid or ""), "")
+                name = self.loc.text(locstr_key(node.get("name")))
+                contact_type = node.get("type")
+                extra = ({"contact_type": str(contact_type)}
+                         if contact_type and not isinstance(contact_type, dict)
+                         else None)
+                add("contact", node, path, name or str(nid or ""), "", extra)
                 walk_folder(node, path, seen)
             elif t == "gameJournalFileGroup":
                 add("file_group", node, path, str(nid or ""), "")
@@ -520,14 +595,18 @@ class DatasetBuilder:
             elif t == "gameJournalFile":
                 title = self.loc.text(locstr_key(node.get("title")))
                 body = self.loc.text(locstr_key(node.get("content")))
-                add("file", node, path, title, body)
+                video = node.get("videoResource")
+                add("file", node, path, title, body,
+                    {"video": video} if isinstance(video, str) and video else None)
             elif t == "gameJournalOnscreenGroup":
                 add("onscreen_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
             elif t == "gameJournalOnscreen":
                 title = self.loc.text(locstr_key(node.get("title")))
                 desc = self.loc.text(locstr_key(node.get("description")))
-                add("onscreen", node, path, title, desc)
+                overrides = self._override_texts(node)
+                add("onscreen", node, path, title, desc,
+                    {"variants": overrides} if overrides else None)
             elif t == "gameJournalBriefing":
                 add("briefing", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
@@ -540,11 +619,19 @@ class DatasetBuilder:
                 add("poi_group", node, path, str(nid or ""), "")
                 walk_folder(node, path, seen)
             elif t == "gameJournalPointOfInterestMappin":
-                add("poi", node, path, str(nid or ""), "")
+                caption = self._mappin_caption(node)
+                assignment = self._ref_name(node.get("recommendedLevelID"))
+                add("poi", node, path, str(nid or ""), caption,
+                    {"content_assignment": assignment} if assignment else None)
             elif t == "gameJournalQuestCodexLink":
                 add("quest_codex_link", node, path, str(nid or ""), "")
-            elif t == "gameJournalQuestMapPin":
-                add("map_pin", node, path, str(nid or ""), "")
+            elif t in ("gameJournalQuestMapPin", "gameJournalQuestMultiMapPin"):
+                add("map_pin", node, path, str(nid or ""),
+                    self._mappin_caption(node))
+                walk_folder(node, path, seen)
+            elif t == "gameJournalQuestTitleModifier":
+                title = self.loc.text(locstr_key(node.get("title")))
+                add("quest_title_variant", node, path, title, "")
             elif t == "gameJournalPath":
                 pass
             else:
@@ -649,6 +736,7 @@ CREATE TABLE tweak_records (
     PRIMARY KEY (source, record_id)
 );
 CREATE INDEX idx_tweak_records_name ON tweak_records (name);
+CREATE INDEX idx_tweak_records_id ON tweak_records (record_id);
 CREATE INDEX idx_tweak_records_type ON tweak_records (type);
 
 CREATE TABLE tweak_queries (
@@ -670,6 +758,7 @@ CREATE TABLE journal (
 );
 CREATE INDEX idx_journal_kind ON journal (kind);
 CREATE INDEX idx_journal_path ON journal (path);
+CREATE INDEX idx_journal_kind_path ON journal (kind, path);
 
 CREATE TABLE subtitles (
     id INTEGER PRIMARY KEY,
@@ -686,18 +775,41 @@ SELECT
     r.name AS record_name,
     r.type AS record_type,
     (SELECT text FROM tweak_flat_texts t WHERE t.name = r.name || '.displayName' AND t.source = r.source) AS display_name,
-    (SELECT text FROM tweak_flat_texts t WHERE t.name = r.name || '.localizedDescription' AND t.source = r.source) AS description
+    (SELECT text FROM tweak_flat_texts t WHERE t.name = r.name || '.localizedDescription' AND t.source = r.source) AS description,
+    (SELECT q.name FROM tweak_flats f JOIN tweak_records q ON q.record_id = CAST(f.value AS INTEGER)
+      WHERE f.name = r.name || '.quality' AND f.source = r.source LIMIT 1) AS quality,
+    (SELECT f.value FROM tweak_flats f
+      WHERE f.name = r.name || '.tags' AND f.source = r.source) AS tags
 FROM tweak_records r
 WHERE r.name LIKE 'Items.%'
   AND EXISTS (SELECT 1 FROM tweak_flat_texts t WHERE t.name = r.name || '.displayName');
 
+CREATE VIEW v_flat_refs AS
+-- TweakDBID-valued flats resolved to the record they point at, so a UI can
+-- follow references (quality, ammo, icon, attacks, ...) without parsing ids.
+SELECT
+    f.source,
+    f.name AS flat_name,
+    f.value AS record_id,
+    r.name AS record_name,
+    r.type AS record_type
+FROM tweak_flats f
+JOIN tweak_records r ON r.record_id = CAST(f.value AS INTEGER) AND r.source = f.source
+WHERE f.flat_type = 'TweakDBID';
+
 CREATE VIEW v_shards AS
--- One row per internet page with all its readable text concatenated.
+-- One row per internet page: the site it belongs to plus all its readable
+-- text in page order. Page and widget "titles" are internal ids, not prose.
 SELECT
     j.source,
     j.path AS page_path,
-    p.title AS page_title,
-    group_concat(j.title, char(10)) AS section_titles,
+    p.entry_id AS page_id,
+    (SELECT s.title FROM journal s
+      WHERE s.kind = 'internet_site' AND s.source = j.source
+        AND j.path LIKE s.path || '/%') AS site_title,
+    (SELECT json_extract(ip.extra, '$.address') FROM journal ip
+      WHERE ip.id = p.id) AS address,
+    COUNT(*) AS text_count,
     group_concat(NULLIF(j.body, ''), char(10) || char(10)) AS body
 FROM journal j
 JOIN journal p ON p.path = j.path AND p.kind = 'internet_page' AND p.source = j.source
@@ -724,13 +836,128 @@ CREATE VIEW v_shard_texts AS
 SELECT j.* FROM journal j WHERE kind = 'shard_text' AND body != '';
 
 CREATE VIEW v_codex AS
-SELECT j.* FROM journal j WHERE kind IN ('codex_section','codex_entry','codex_description');
+-- One row per codex article: the entry's own title (description rows carry a
+-- subtitle at most) with the description text that belongs to it. Leftover
+-- dev markers (!WIP, TODO) are nulled out; `v_codex_tree` keeps them verbatim.
+SELECT
+    d.source,
+    d.id,
+    e.path AS entry_path,
+    e.title AS title,
+    CASE
+        WHEN d.title = '' THEN NULL
+        WHEN d.title LIKE '!%' THEN NULL
+        WHEN upper(d.title) LIKE 'WIP%' THEN NULL
+        WHEN upper(d.title) LIKE 'TODO%' THEN NULL
+        ELSE d.title
+    END AS subtitle,
+    d.body AS body,
+    (SELECT c.title FROM journal c
+      WHERE c.kind = 'codex_section' AND c.source = e.source
+        AND e.path LIKE c.path || '/%'
+      ORDER BY length(c.path) DESC LIMIT 1) AS section,
+    d.extra
+FROM journal d
+JOIN journal e ON e.kind = 'codex_entry' AND e.source = d.source
+              AND d.path LIKE e.path || '/%'
+WHERE d.kind = 'codex_description';
+
+CREATE VIEW v_codex_tree AS
+SELECT j.* FROM journal j
+WHERE kind IN ('codex_section', 'codex_entry', 'codex_description');
 
 CREATE VIEW v_emails AS
-SELECT j.* FROM journal j WHERE kind = 'email';
+SELECT
+    j.id,
+    j.source,
+    j.path,
+    j.title AS subject,
+    json_extract(j.extra, '$.sender') AS sender,
+    json_extract(j.extra, '$.addressee') AS addressee,
+    j.body
+FROM journal j
+WHERE j.kind = 'email';
+
+CREATE VIEW v_contacts AS
+SELECT
+    c.id,
+    c.source,
+    c.path,
+    c.entry_id AS contact_id,
+    c.title AS name,
+    json_extract(c.extra, '$.contact_type') AS contact_type,
+    (SELECT COUNT(*) FROM journal m
+      WHERE m.kind = 'phone_message' AND m.source = c.source
+        AND m.path LIKE c.path || '/%') AS message_count
+FROM journal c
+WHERE c.kind = 'contact';
+
+CREATE VIEW v_phone AS
+-- Every phone message and reply option in conversation order, attributed to
+-- the contact whose thread it belongs to.
+SELECT
+    m.id,
+    m.source,
+    (SELECT c.title FROM journal c
+      WHERE c.kind = 'contact' AND c.source = m.source
+        AND m.path LIKE c.path || '/%') AS contact,
+    (SELECT v.title FROM journal v
+      WHERE v.kind = 'phone_conversation' AND v.source = m.source
+        AND m.path LIKE v.path || '/%'
+      ORDER BY length(v.path) DESC LIMIT 1) AS conversation,
+    CASE m.kind WHEN 'phone_message' THEN 'message' ELSE 'choice' END AS line_type,
+    m.entry_id,
+    m.body AS text,
+    json_extract(m.extra, '$.quest_important') AS quest_important,
+    m.path
+FROM journal m
+WHERE m.kind IN ('phone_message', 'phone_choice') AND m.body <> '';
+
+CREATE VIEW v_map_pins AS
+SELECT j.id, j.source, j.kind, j.path, j.entry_id, j.body AS caption,
+       json_extract(j.extra, '$.content_assignment') AS content_assignment
+FROM journal j
+WHERE j.kind IN ('map_pin', 'poi') AND j.body <> '';
 
 CREATE VIEW v_quests AS
-SELECT j.* FROM journal j WHERE kind IN ('quest','quest_phase','quest_objective','quest_description');
+SELECT
+    q.id,
+    q.source,
+    q.path,
+    q.title,
+    json_extract(q.extra, '$.quest_type') AS quest_type,
+    json_extract(q.extra, '$.district') AS district,
+    json_extract(q.extra, '$.content_assignment') AS content_assignment,
+    (SELECT d.body FROM journal d
+      WHERE d.kind = 'quest_description' AND d.source = q.source
+        AND d.path LIKE q.path || '/%' AND d.body <> ''
+      ORDER BY d.id LIMIT 1) AS description,
+    (SELECT COUNT(*) FROM journal o
+      WHERE o.kind = 'quest_objective' AND o.source = q.source
+        AND o.path LIKE q.path || '/%') AS objective_count
+FROM journal q
+WHERE q.kind = 'quest';
+
+CREATE VIEW v_objectives AS
+SELECT
+    o.id,
+    o.source,
+    o.path,
+    (SELECT q.title FROM journal q
+      WHERE q.kind = 'quest' AND q.source = o.source
+        AND o.path LIKE q.path || '/%'
+      ORDER BY length(q.path) DESC LIMIT 1) AS quest,
+    o.entry_id,
+    o.body AS description,
+    json_extract(o.extra, '$.optional') AS optional,
+    json_extract(o.extra, '$.counter') AS counter
+FROM journal o
+WHERE o.kind = 'quest_objective' AND o.body <> '';
+
+CREATE VIEW v_quest_tree AS
+SELECT j.* FROM journal j
+WHERE kind IN ('quest', 'quest_phase', 'quest_objective', 'quest_description',
+               'quest_title_variant');
 
 CREATE VIEW v_tarots AS
 SELECT j.* FROM journal j WHERE kind = 'tarot';

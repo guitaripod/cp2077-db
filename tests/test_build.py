@@ -78,9 +78,13 @@ class BuildTests(unittest.TestCase):
                 self.assertGreaterEqual(self.count(table), minimum)
 
     def test_views_resolve_text(self):
-        for view, minimum in (("v_shards", 600), ("v_codex", 500),
-                              ("v_emails", 500), ("v_quests", 500),
-                              ("v_tarots", 20), ("v_dialogue", 100_000), ("v_items", 10_000),
+        for view, minimum in (("v_shards", 600), ("v_codex", 400),
+                              ("v_codex_tree", 900), ("v_emails", 500),
+                              ("v_contacts", 150), ("v_phone", 4_000),
+                              ("v_quests", 350), ("v_objectives", 4_000),
+                              ("v_quest_tree", 6_000), ("v_map_pins", 1_000),
+                              ("v_tarots", 20), ("v_dialogue", 100_000),
+                              ("v_items", 10_000), ("v_flat_refs", 500_000),
                               ("v_vehicles", 100), ("v_perks", 100)):
             with self.subTest(view=view):
                 self.assertGreaterEqual(self.count(view), minimum)

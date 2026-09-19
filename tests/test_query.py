@@ -26,7 +26,7 @@ JOURNAL_ROWS = [
      "body", "Militech denies involvement in the tower raid.", None),
     ("base", "codex_entry", "c1", "codex/characters/johnny",
      "Johnny Silverhand", "", None),
-    ("base", "codex_description", "c2", "codex/characters/johnny",
+    ("base", "codex_description", "c2", "codex/characters/johnny/johnny_desc",
      "", "A rockerboy engram riding in V's head.", None),
     ("ep1", "email", "e1", "onscreens/emails/quests/dogtown",
      "Welcome to Dogtown", "Barghest runs the place now.",
@@ -38,6 +38,27 @@ LOCKEY_ROWS = [
     ("LocKey#2", "ui-militech-label", "Militech", "Militech"),
 ]
 
+PHONE_ROWS = [
+    ("base", "contact", "zane", "contacts/zane", "Zane", "",
+     json.dumps({"contact_type": "Friend"})),
+    ("base", "phone_conversation", "mq030", "contacts/zane/mq030",
+     "About the gig", "", None),
+    ("base", "phone_message", "m1", "contacts/zane/mq030/m1", "",
+     "Thanks for the help, V.", json.dumps({"quest_important": True})),
+    ("base", "phone_choice", "c1", "contacts/zane/mq030/c1", "",
+     "Anytime.", None),
+    ("base", "quest", "q001", "quests/main_quest/q001", "The Heist", "",
+     json.dumps({"quest_type": "MainQuest", "district": "Districts.Watson",
+                 "content_assignment": "DeviceContentAssignment.q001"})),
+    ("base", "quest_description", "d1", "quests/main_quest/q001/d1", "d1",
+     "Steal the relic from Konpeki Plaza.", None),
+    ("base", "quest_objective", "o1", "quests/main_quest/q001/o1", "o1",
+     "Meet Jackie at the bar.", json.dumps({"optional": True})),
+    ("base", "map_pin", "p1", "quests/main_quest/q001/p1", "p1",
+     "Konpeki Plaza", None),
+    ("base", "internet_site", "n54", "internet_sites/n54", "N54 News", "", None),
+]
+
 SUBTITLE_ROWS = [
     ("base", "base\\localization\\en-us\\subtitles\\q101.json", "1",
      "Wake up, samurai. We have a city to burn."),
@@ -46,11 +67,14 @@ SUBTITLE_ROWS = [
 ]
 
 
+ALL_ROWS = JOURNAL_ROWS + PHONE_ROWS
+
+
 def make_dataset(path: Path) -> None:
     con = sqlite3.connect(path)
     con.executescript(build.SCHEMA)
     con.executescript(build.FTS_SCHEMA)
-    con.executemany(build.JOURNAL_INSERT, JOURNAL_ROWS)
+    con.executemany(build.JOURNAL_INSERT, ALL_ROWS)
     con.executemany(
         "INSERT INTO lockeys (loc_key, secondary_key, female_variant, male_variant)"
         " VALUES (?, ?, ?, ?)", LOCKEY_ROWS)
@@ -91,7 +115,7 @@ class SchemaTests(DatasetTestCase):
         con = sqlite3.connect(self.db)
         ids = [r[0] for r in con.execute("SELECT id FROM journal ORDER BY id")]
         con.close()
-        self.assertEqual(ids, list(range(1, len(JOURNAL_ROWS) + 1)))
+        self.assertEqual(ids, list(range(1, len(ALL_ROWS) + 1)))
 
     def test_older_dataset_is_rejected_with_a_rebuild_hint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,9 +196,37 @@ class PageTests(DatasetTestCase):
         self.assertEqual(rc, 0)
         rows = json.loads(out)
         self.assertEqual(rows[0]["page_path"], "internet_sites/n54/tower")
+        self.assertEqual(rows[0]["site_title"], "N54 News")
 
     def test_unknown_page_returns_one(self):
         rc, _ = self.run_cli("page", "no-such-page")
+        self.assertEqual(rc, 1)
+
+
+class ShowTests(DatasetTestCase):
+    def test_show_by_id(self):
+        rc, out = self.run_cli("show", "2")
+        self.assertEqual(rc, 0)
+        self.assertIn("Arasaka tower stands over Night City.", out)
+
+    def test_show_by_path_includes_descendants(self):
+        rc, out = self.run_cli("show", "codex/characters/johnny")
+        self.assertEqual(rc, 0)
+        self.assertIn("Johnny Silverhand", out)
+        self.assertIn("rockerboy engram", out)
+
+    def test_show_by_fragment(self):
+        rc, out = self.run_cli("show", "dogtown")
+        self.assertEqual(rc, 0)
+        self.assertIn("Welcome to Dogtown", out)
+
+    def test_show_json(self):
+        rc, out = self.run_cli("show", "codex/characters/johnny", "--json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(json.loads(out)), 2)
+
+    def test_show_unknown_returns_one(self):
+        rc, _ = self.run_cli("show", "nothing-like-this")
         self.assertEqual(rc, 1)
 
 
@@ -183,7 +235,9 @@ class TreeTests(DatasetTestCase):
         rc, out = self.run_cli("tree", "--json")
         self.assertEqual(rc, 0)
         roots = {r["path"]: r["entries"] for r in json.loads(out)}
-        self.assertEqual(set(roots), {"internet_sites", "codex", "onscreens"})
+        self.assertEqual(set(roots),
+                         {"internet_sites", "codex", "onscreens", "contacts",
+                          "quests"})
         self.assertEqual(roots["codex"], 2)
 
     def test_descends_into_a_prefix(self):
@@ -203,6 +257,75 @@ class TreeTests(DatasetTestCase):
         self.assertEqual(rc, 1)
 
 
+class CuratedViewTests(DatasetTestCase):
+    def rows(self, sql: str) -> list[dict]:
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(sql)]
+        finally:
+            con.close()
+
+    def test_dev_placeholder_subtitles_are_suppressed(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "UPDATE journal SET title = '!WIP' WHERE kind = 'codex_description'")
+        con.commit()
+        subtitle = con.execute("SELECT subtitle FROM v_codex").fetchone()[0]
+        con.execute("UPDATE journal SET title = '' WHERE kind = 'codex_description'")
+        con.commit()
+        con.close()
+        self.assertIsNone(subtitle)
+
+    def test_codex_descriptions_inherit_their_entry_title(self):
+        row = self.rows("SELECT * FROM v_codex")[0]
+        self.assertEqual(row["title"], "Johnny Silverhand")
+        self.assertIsNone(row["subtitle"])
+        self.assertIn("rockerboy engram", row["body"])
+
+    def test_emails_expose_sender_and_addressee(self):
+        row = self.rows("SELECT * FROM v_emails")[0]
+        self.assertEqual(row["subject"], "Welcome to Dogtown")
+        self.assertEqual(row["sender"], "Mr. Hands")
+
+    def test_contacts_carry_names_and_message_counts(self):
+        row = self.rows("SELECT * FROM v_contacts")[0]
+        self.assertEqual(row["name"], "Zane")
+        self.assertEqual(row["contact_type"], "Friend")
+        self.assertEqual(row["message_count"], 1)
+
+    def test_phone_lines_are_attributed_to_contact_and_thread(self):
+        rows = self.rows("SELECT * FROM v_phone ORDER BY id")
+        self.assertEqual([r["line_type"] for r in rows], ["message", "choice"])
+        self.assertEqual({r["contact"] for r in rows}, {"Zane"})
+        self.assertEqual(rows[0]["conversation"], "About the gig")
+        self.assertEqual(rows[0]["quest_important"], 1)
+
+    def test_quests_carry_metadata_and_description(self):
+        row = self.rows("SELECT * FROM v_quests")[0]
+        self.assertEqual(row["title"], "The Heist")
+        self.assertEqual(row["quest_type"], "MainQuest")
+        self.assertEqual(row["district"], "Districts.Watson")
+        self.assertEqual(row["content_assignment"],
+                         "DeviceContentAssignment.q001")
+        self.assertIn("Konpeki", row["description"])
+        self.assertEqual(row["objective_count"], 1)
+
+    def test_objectives_name_their_quest(self):
+        row = self.rows("SELECT * FROM v_objectives")[0]
+        self.assertEqual(row["quest"], "The Heist")
+        self.assertEqual(row["optional"], 1)
+
+    def test_map_pins_expose_captions(self):
+        self.assertEqual([r["caption"] for r in self.rows("SELECT * FROM v_map_pins")],
+                         ["Konpeki Plaza"])
+
+    def test_shards_name_their_site(self):
+        row = self.rows("SELECT * FROM v_shards")[0]
+        self.assertEqual(row["site_title"], "N54 News")
+        self.assertEqual(row["text_count"], 2)
+
+
 class ViewTests(DatasetTestCase):
     def test_dialogue_view_extracts_the_scene_name(self):
         con = sqlite3.connect(self.db)
@@ -214,7 +337,7 @@ class ViewTests(DatasetTestCase):
         rc, out = self.run_cli("stats", "--json")
         self.assertEqual(rc, 0)
         stats = json.loads(out)
-        self.assertEqual(stats["tables"]["journal"], len(JOURNAL_ROWS))
+        self.assertEqual(stats["tables"]["journal"], len(ALL_ROWS))
         self.assertIn("v_dialogue", stats["views"])
 
     def test_shard_view_concatenates_page_text(self):
