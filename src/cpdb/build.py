@@ -804,7 +804,7 @@ SELECT
     j.source,
     j.path AS page_path,
     p.entry_id AS page_id,
-    (SELECT s.title FROM journal s
+    (SELECT COALESCE(NULLIF(s.title, ''), s.entry_id) FROM journal s
       WHERE s.kind = 'internet_site' AND s.source = j.source
         AND j.path LIKE s.path || '/%') AS site_title,
     (SELECT json_extract(ip.extra, '$.address') FROM journal ip

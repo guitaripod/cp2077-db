@@ -248,6 +248,10 @@ def main(argv: list[str] | None = None) -> int:
     p_item.add_argument("record_name", help="e.g. Items.Preset_Yukimura_Default")
     p_item.add_argument("--json", action="store_true")
 
+    p_export = sub.add_parser("export", help="derive a smaller dataset (reader profile)")
+    p_export.add_argument("dst", help="output SQLite file")
+    p_export.add_argument("--profile", default="reader", help="reader (default)")
+
     p_stats = sub.add_parser("stats", help="row counts per table/view")
     p_stats.add_argument("--json", action="store_true")
 
@@ -393,15 +397,29 @@ def main(argv: list[str] | None = None) -> int:
                     for k in row.keys():
                         print(f"{k}: {row[k]}")
 
+        elif args.cmd == "export":
+            from .export import ExportError, export
+
+            con.close()
+            try:
+                export(db, Path(args.dst), args.profile)
+            except ExportError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            print(f"exported {args.profile} dataset -> {args.dst}")
+            return 0
+
         elif args.cmd == "stats":
             names = [r[0] for r in con.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%' "
                 "ORDER BY name")]
+            present = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='view'")}
             tables = [(n, con.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0])
                       for n in names]
             views = [(v, con.execute(f'SELECT COUNT(*) FROM "{v}"').fetchone()[0])
-                     for v in VIEWS]
+                     for v in VIEWS if v in present]
             if args.json:
                 print(json.dumps({"tables": dict(tables), "views": dict(views)},
                                  indent=1))
