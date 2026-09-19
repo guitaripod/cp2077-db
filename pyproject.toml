@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cpdb"
-version = "1.0.0"
+version = "0.1.0"
 description = "Extract every readable string from a Cyberpunk 2077 install into one queryable SQLite dataset"
 readme = "README.md"
 requires-python = ">=3.10"
