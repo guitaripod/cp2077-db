@@ -444,6 +444,8 @@ class CliTests(unittest.TestCase):
                     (str(cli.REQUIRED_SCHEMA_VERSION),))
         con.execute("CREATE TABLE journal (title TEXT)")
         con.execute("INSERT INTO journal VALUES ('Arasaka tower')")
+        con.execute("CREATE VIRTUAL TABLE journal_fts USING fts5(title)")
+        con.execute("INSERT INTO journal_fts(rowid, title) VALUES (1, 'Arasaka tower')")
         con.commit()
         con.close()
 
@@ -464,6 +466,18 @@ class CliTests(unittest.TestCase):
 
     def test_bad_sql_reports_cleanly(self):
         self.assertEqual(main([str(self.db), "sql", "SELECT * FROM nope"]), 2)
+
+    def test_search_without_any_index_reports_cleanly(self):
+        bare = self.dir / "bare.sqlite"
+        con = sqlite3.connect(bare)
+        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("INSERT INTO meta VALUES ('schema_version', ?)",
+                    (str(cli.REQUIRED_SCHEMA_VERSION),))
+        con.commit()
+        con.close()
+        with self.assertRaises(SystemExit) as cm:
+            main([str(bare), "search", "tower"])
+        self.assertIn("no full-text index", str(cm.exception))
 
     def test_bad_fts_expression_reports_cleanly(self):
         self.assertEqual(main([str(self.db), "search", "unbalanced("]), 2)

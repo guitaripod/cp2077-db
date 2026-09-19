@@ -394,6 +394,38 @@ class ViewTests(DatasetTestCase):
         self.assertIn("images", out)
 
 
+class ReaderProfileSearchTests(DatasetTestCase):
+    """A reader-profile dataset has no lockeys; search must still work."""
+
+    def setUp(self):
+        self.reader = Path(self.tmp.name) / "reader.sqlite"
+        if not self.reader.exists():
+            make_dataset(self.reader)
+            con = sqlite3.connect(self.reader)
+            con.execute("DROP TABLE lockeys_fts")
+            con.execute("DROP TABLE lockeys")
+            con.commit()
+            con.close()
+
+    def run_reader(self, *args: str) -> tuple[int, str]:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli.main([str(self.reader), *args])
+        return rc, out.getvalue()
+
+    def test_default_sources_skip_the_missing_index(self):
+        rc, out = self.run_reader("search", "tower", "--json")
+        self.assertEqual(rc, 0)
+        hits = json.loads(out)
+        self.assertTrue(hits)
+        self.assertNotIn("lockey", {h["src"] for h in hits})
+
+    def test_asking_for_the_missing_index_by_name_is_an_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_reader("search", "tower", "--source", "lockey")
+        self.assertIn("no lockey index", str(cm.exception))
+
+
 class ImageCommandTests(DatasetTestCase):
     def test_writes_a_picture_by_key(self):
         out = Path(self.tmp.name) / "johnny.webp"

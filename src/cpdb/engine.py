@@ -3,23 +3,49 @@
 
 Parses REDengine RDAR .archive containers (v11/v12) and extracts entries,
 reimplementing WolvenKit's C# readers (WolvenKit.RED4/Archive/IO/ArchiveReader.cs,
-GPL-3.0) in stdlib Python. Decompression goes through libkraken.so, WolvenKit's
-Linux Oodle Kraken binding, vendored under lib/.
+GPL-3.0) in stdlib Python. Decompression goes through WolvenKit's Oodle Kraken
+binding, vendored under lib/ and loaded on first use, so querying a built
+dataset needs no native library at all.
 """
 from __future__ import annotations
 
 import ctypes
 import hashlib
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-KRAKEN_LIB = str(Path(__file__).resolve().parent / "lib" / "libkraken.so")
-_kraken = ctypes.CDLL(KRAKEN_LIB)
-_kraken.Kraken_Decompress.restype = ctypes.c_int
-_kraken.Kraken_Decompress.argtypes = [
-    ctypes.c_char_p, ctypes.c_long, ctypes.c_char_p, ctypes.c_long,
-]
+LIB_DIR = Path(__file__).resolve().parent / "lib"
+_kraken = None
+
+
+def kraken_library() -> ctypes.CDLL:
+    """The vendored Oodle Kraken binding, loaded on first use.
+
+    Only reading archives needs it, so a dataset that is merely queried works
+    on any platform; a host with no vendored build says so instead of dying
+    with a dlopen traceback at import.
+    """
+    global _kraken
+    if _kraken is not None:
+        return _kraken
+    names = {"darwin": "libkraken.dylib", "win32": "kraken.dll"}
+    name = names.get(sys.platform, "libkraken.so")
+    path = LIB_DIR / name
+    if not path.is_file():
+        raise ArchiveError(
+            f"no Oodle Kraken library for this platform ({sys.platform}): "
+            f"expected {path}. Reading game archives needs one; querying an "
+            "existing dataset does not."
+        )
+    lib = ctypes.CDLL(str(path))
+    lib.Kraken_Decompress.restype = ctypes.c_int
+    lib.Kraken_Decompress.argtypes = [
+        ctypes.c_char_p, ctypes.c_long, ctypes.c_char_p, ctypes.c_long,
+    ]
+    _kraken = lib
+    return lib
 
 FNV_BASIS = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
@@ -49,9 +75,10 @@ def kraken_decompress(src: bytes, uncompressed_size: int) -> bytes:
     into it past the call; the output buffer is deliberately over-allocated by
     64 bytes (the lib writes quantum padding beyond dst_len).
     """
+    lib = kraken_library()
     src_buf = ctypes.create_string_buffer(src, len(src))
     out_buf = ctypes.create_string_buffer(uncompressed_size + 64)
-    n = _kraken.Kraken_Decompress(src_buf, len(src), out_buf, uncompressed_size)
+    n = lib.Kraken_Decompress(src_buf, len(src), out_buf, uncompressed_size)
     if n != uncompressed_size:
         raise ValueError(
             f"kraken decompress returned {n}, expected {uncompressed_size}"

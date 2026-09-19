@@ -31,6 +31,10 @@ own datashards are `kind = 'onscreen'`), `subtitles`, `lockeys`, `tweak_records`
 `journal.extra` as `image`, `thumb` or `avatar`), `meta`. `journal.id` is stable across rebuilds
 of the same game files.
 
+Building a dataset needs Linux: the vendored Oodle Kraken decompressor is a Linux
+`.so`, and it is loaded only when an archive is read, so querying, exporting and
+dumping pictures from a dataset someone else built works on macOS and Windows too.
+
 Parsers for RDAR archives, TweakDB blobs and CR2W resources are reimplemented from
 [WolvenKit](https://github.com/WolvenKit/WolvenKit)'s readers; `libkraken.so` and the hash
 tables are vendored from it. Builds are deterministic (two builds are byte-identical) and

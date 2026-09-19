@@ -44,6 +44,11 @@ REQUIRED_SCHEMA_VERSION = 4
 
 SEARCH_SOURCES = ("journal", "lockey", "subtitle")
 
+#: The FTS index each search source reads; a profile that drops the table
+#: (the reader export has no lockeys) simply drops the source.
+SEARCH_INDEX = {"journal": "journal_fts", "lockey": "lockeys_fts",
+                "subtitle": "subtitles_fts"}
+
 SEARCH_SQL = {
     "journal": (
         "SELECT j.id AS id, j.kind AS kind, j.path AS ctx, j.title AS title, "
@@ -124,6 +129,27 @@ def parse_sources(value: str | None) -> list[str]:
             f"choose from {', '.join(SEARCH_SOURCES)}"
         )
     return chosen
+
+
+def available_sources(con: sqlite3.Connection, chosen: list[str],
+                      explicit: bool) -> list[str]:
+    """`chosen` minus the sources this dataset has no index for.
+
+    Asking for a missing one by name is an error; the default list quietly
+    narrows, so `search` works the same on a full and a reader dataset.
+    """
+    present = {row[0] for row in con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    usable = [s for s in chosen if SEARCH_INDEX[s] in present]
+    missing = [s for s in chosen if s not in usable]
+    if missing and explicit:
+        raise SystemExit(
+            f"error: this dataset has no {', '.join(missing)} index "
+            "(the reader profile drops it)"
+        )
+    if not usable:
+        raise SystemExit("error: this dataset has no full-text index to search")
+    return usable
 
 
 def path_children(con: sqlite3.Connection, prefix: str) -> list[tuple]:
@@ -306,8 +332,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.cmd == "search":
-            rows = ranked_search(con, args.query, parse_sources(args.source),
-                                 args.limit)
+            sources = available_sources(
+                con, parse_sources(args.source), args.source is not None)
+            rows = ranked_search(con, args.query, sources, args.limit)
             if args.json:
                 print(json.dumps([dict(zip(SEARCH_COLUMNS, r)) for r in rows],
                                  indent=1))
